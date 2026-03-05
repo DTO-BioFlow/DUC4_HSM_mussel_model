@@ -1,0 +1,4 @@
+/.dockerignore
+/BPNS input layers median
+/data
+/results_cpp
