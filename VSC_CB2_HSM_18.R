@@ -122,15 +122,27 @@ for (i in 1:12) {
 }
 
 # Apply fuzzy logic model
-results_HSM_Cpp <- list()
+# results_HSM_Cpp <- list()
 # for (j in 1:12) {
-for (j in 1:1) {
-  print(paste0("Processing month: ", j))
-  results_HSM_Cpp[[j]] <- hsm_calc_year_cpp(BPNS_aggr2, j, 301)
+# # for (j in 1:1) {
+#   print(paste0("Processing month: ", j))
+#   results_HSM_Cpp[[j]] <- hsm_calc_year_cpp(BPNS_aggr2, j, 301)
+# }
+results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
+  lapply(months_to_process, function(j) {
+    cat("Processing month:", j, "\n")
+    hsm_calc_year_cpp(BPNS_aggr2, j, 301)
+  })
+} else {
+  parallel::mclapply(months_to_process, function(j) {
+    cat("Processing month:", j, "\n")
+    hsm_calc_year_cpp(BPNS_aggr2, j, 301)
+  }, mc.cores = n_cores)
 }
+names(results_HSM_Cpp) <- as.character(months_to_process)
 
-# for (j in 1:12) {
-for (i in 1) {
+for (i in 1:12) {
+# for (i in 1) {
   if (!dir.exists(output_dir)) {
     dir.create(output_dir, recursive = TRUE)
   }

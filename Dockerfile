@@ -26,4 +26,4 @@ RUN mkdir -p "/tmp/mussel-model/input/BPNS input layers median" "/tmp/mussel-mod
 
 RUN R -q -e "install.packages(c('Rcpp','FuzzyR','raster','terra','doSNOW','foreach','iterators','sp','paws'), repos='https://cloud.r-project.org')"
 
-ENTRYPOINT ["Rscript", "VSC_CB2_HSM_18_cpp.R"]
+ENTRYPOINT ["Rscript", "VSC_CB2_HSM_18.R"]
