@@ -1,16 +1,11 @@
 FROM rocker/r-ver:4.3.3
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PROJECT_DIR=/app
-ENV INPUT_FOLDER_NAME=input
-ENV OUTPUT_FOLDER_NAME=output
-ENV RC_LIST_PATH=/app/input/rc_list_year.rds
-ENV BPNS_INPUT_DIR="/app/input/BPNS input layers median"
-ENV OUTPUT_DIR=/output
-ENV S3_INPUT_PREFIX=input
-ENV S3_OUTPUT_PREFIX=output
+ENV TZ=UTC
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
     libgdal-dev \
     libgeos-dev \
     libproj-dev \
@@ -27,8 +22,8 @@ WORKDIR /app
 
 COPY . /app
 
-RUN mkdir -p /data /output
+RUN mkdir -p "/tmp/mussel-model/input/BPNS input layers median" "/tmp/mussel-model/output"
 
 RUN R -q -e "install.packages(c('Rcpp','FuzzyR','raster','terra','doSNOW','foreach','iterators','sp','paws'), repos='https://cloud.r-project.org')"
 
-CMD ["Rscript", "VSC_CB2_HSM_18_cpp.R"]
+ENTRYPOINT ["Rscript", "VSC_CB2_HSM_18_cpp.R"]
