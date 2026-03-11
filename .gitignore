@@ -2,3 +2,6 @@
 /BPNS input layers median
 /data
 /results_cpp
+/input
+/output
+.gitignore
