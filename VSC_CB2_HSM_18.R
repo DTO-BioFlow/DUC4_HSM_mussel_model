@@ -128,6 +128,9 @@ for (i in 1:12) {
 #   print(paste0("Processing month: ", j))
 #   results_HSM_Cpp[[j]] <- hsm_calc_year_cpp(BPNS_aggr2, j, 301)
 # }
+n_cores <- max(1, parallel::detectCores() - 1)
+cat(">>> Worker count:", n_cores, "\n")
+months_to_process <- 1:12
 results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
   lapply(months_to_process, function(j) {
     cat("Processing month:", j, "\n")
