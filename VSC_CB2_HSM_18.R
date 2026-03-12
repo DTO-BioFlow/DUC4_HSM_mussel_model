@@ -111,6 +111,8 @@ if (!ensure_bpns_inputs_available(bpns_input_dir)) {
 }
 toc("Ensure required input files", t0)
 
+months_to_process <- 1:12
+
 # create response curves ----------------------
 t0 <- tic("Load response curves")
 rc_list <- readRDS(rc_list_path)
@@ -134,13 +136,13 @@ BPNS <- NULL
 BPNS <- food_for_HSM(folder)
 
 BPNS_aggr <- NULL
-for (i in 1:12) {
+for (i in months_to_process) {
   BPNS_aggr[[i]] <- aggregate(BPNS[[i]], fact = 10)
 }
 
 # changing NA to -9999 to work with fuzzy logic
 BPNS_aggr2 <- NULL
-for (i in 1:12) {
+for (i in months_to_process) {
   BPNS_aggr2[[i]] <- calc(stack(BPNS_aggr[[i]]), fun9999)
 }
 toc("Load and preprocess BPNS data", t0)
@@ -155,7 +157,6 @@ t0 <- tic("Run monthly HSM calculations")
 # }
 n_cores <- max(1, parallel::detectCores() - 1)
 cat(">>> Worker count:", n_cores, "\n")
-months_to_process <- 1:12
 results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
   lapply(months_to_process, function(j) {
     cat("Processing month:", j, "\n")
@@ -171,7 +172,7 @@ names(results_HSM_Cpp) <- as.character(months_to_process)
 toc("Run monthly HSM calculations", t0)
 
 t0 <- tic("Write raster outputs")
-for (i in 1:12) {
+for (i in months_to_process) {
 # for (i in 1) {
   if (!dir.exists(output_dir)) {
     dir.create(output_dir, recursive = TRUE)
