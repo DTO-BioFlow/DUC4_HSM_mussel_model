@@ -9,10 +9,25 @@ library(foreach)
 source("functions_WS.R")
 source("functions_S3.R")
 
+# Simple timing helpers for section-level runtime reporting
+timings <- data.frame(section = character(), seconds = numeric(), stringsAsFactors = FALSE)
+tic <- function(section) {
+  cat(">>> [START]", section, "\n")
+  proc.time()["elapsed"]
+}
+toc <- function(section, t0) {
+  elapsed <- unname(proc.time()["elapsed"] - t0)
+  timings <<- rbind(timings, data.frame(section = section, seconds = elapsed, stringsAsFactors = FALSE))
+  cat(">>> [DONE]", section, "-", sprintf("%.2f", elapsed), "s\n")
+}
+
+script_t0 <- tic("Total runtime")
+
 #########################################
 ##             Main script             ##
 #########################################
 # Preparations -----------------------------------------------------------------
+t0 <- tic("Preparations")
 setwd("/app")
 
 # Local staging directories (ephemeral — data is pulled from S3 and results pushed back)
@@ -27,6 +42,7 @@ s3_output_prefix <- Sys.getenv("S3_OUTPUT_PREFIX", "output")
 
 s3_client <- build_s3_client()
 s3_bucket <- resolve_bucket()
+toc("Preparations", t0)
 
 ensure_rc_list_available <- function(path) {
   if (file.exists(path)) {
@@ -86,25 +102,32 @@ ensure_bpns_inputs_available <- function(dir_path) {
   length(missing_after) == 0
 }
 
+t0 <- tic("Ensure required input files")
 if (!ensure_rc_list_available(rc_list_path)) {
   stop(paste("RC_LIST_PATH file not found locally or in S3:", rc_list_path))
 }
 if (!ensure_bpns_inputs_available(bpns_input_dir)) {
   stop(paste("BPNS_INPUT_DIR is missing required files locally and in S3:", bpns_input_dir))
 }
+toc("Ensure required input files", t0)
 
 # create response curves ----------------------
+t0 <- tic("Load response curves")
 rc_list <- readRDS(rc_list_path)
+toc("Load response curves", t0)
 
 
 # build fuzzy logic model ----------------------
+t0 <- tic("Build fuzzy logic model")
 parameters <- c("temp", "sal", "oxy", "sub", "sed", "cur", "orb", "chl", "shear")
 
 specif_rules_year <- NULL
 
 fuzzy_model_year <- build_fuzzy_logic_model_yearrc(parameters, specif_rules_year)
+toc("Build fuzzy logic model", t0)
 
 # load HSM input data (raster shape)
+t0 <- tic("Load and preprocess BPNS data")
 folder <- if (grepl("[/\\]$", bpns_input_dir)) bpns_input_dir else paste0(bpns_input_dir, "/")
 
 BPNS <- NULL
@@ -120,8 +143,10 @@ BPNS_aggr2 <- NULL
 for (i in 1:12) {
   BPNS_aggr2[[i]] <- calc(stack(BPNS_aggr[[i]]), fun9999)
 }
+toc("Load and preprocess BPNS data", t0)
 
 # Apply fuzzy logic model
+t0 <- tic("Run monthly HSM calculations")
 # results_HSM_Cpp <- list()
 # for (j in 1:12) {
 # # for (j in 1:1) {
@@ -143,7 +168,9 @@ results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
   }, mc.cores = n_cores)
 }
 names(results_HSM_Cpp) <- as.character(months_to_process)
+toc("Run monthly HSM calculations", t0)
 
+t0 <- tic("Write raster outputs")
 for (i in 1:12) {
 # for (i in 1) {
   if (!dir.exists(output_dir)) {
@@ -152,7 +179,9 @@ for (i in 1:12) {
   writeRaster(results_HSM_Cpp[[i]], filename = file.path(output_dir, paste0("BPNS_", i, ".tif")),
               format = "GTiff", overwrite = TRUE)
 }
+toc("Write raster outputs", t0)
 
+t0 <- tic("Upload outputs to S3")
 if (!is.null(s3_client) && nzchar(s3_bucket)) {
   cat(">>> Uploading output files to", paste0("s3://", s3_bucket, "/", s3_output_prefix), "\n")
   upload_dir_to_s3(s3_client, s3_bucket, output_dir, s3_output_prefix)
@@ -160,3 +189,8 @@ if (!is.null(s3_client) && nzchar(s3_bucket)) {
 } else {
   cat(">>> Skipping S3 upload: no S3 client or bucket configured\n")
 }
+toc("Upload outputs to S3", t0)
+
+toc("Total runtime", script_t0)
+cat("\n>>> Timing summary (seconds):\n")
+print(timings)
