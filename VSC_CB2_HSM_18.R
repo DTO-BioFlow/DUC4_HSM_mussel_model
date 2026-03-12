@@ -194,3 +194,10 @@ toc("Upload outputs to S3", t0)
 toc("Total runtime", script_t0)
 cat("\n>>> Timing summary (seconds):\n")
 print(timings)
+
+timing_file <- file.path(output_dir, "timing_summary.txt")
+writeLines(c(
+  ">>> Timing summary (seconds):",
+  capture.output(print(timings))
+), con = timing_file)
+cat(">>> Timing summary saved to", timing_file, "\n")
