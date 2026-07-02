@@ -16,14 +16,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2-dev \
     make \
     g++ \
+    awscli \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY . /app
-
-RUN mkdir -p "/tmp/mussel-model/input/BPNS input layers median" "/tmp/mussel-model/output"
+RUN mkdir -p /app/output /app/input /app/scripts
 
 RUN R -q -e "install.packages(c('Rcpp','FuzzyR','raster','terra','doSNOW','foreach','iterators','sp','paws'), repos='https://cloud.r-project.org')"
 
-ENTRYPOINT ["Rscript", "VSC_CB2_HSM_18.R"]
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV SCRIPT_NAME=VSC_CB2_HSM_18.R \
+    S3_SCRIPTS_PREFIX=scripts \
+    S3_INPUT_PREFIX=input \
+    S3_OUTPUT_PREFIX=output
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

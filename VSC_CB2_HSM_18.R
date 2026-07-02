@@ -5,9 +5,61 @@ library(terra)
 library(doSNOW)
 library(foreach)
 
+if (!requireNamespace("paws", quietly = TRUE)) {
+  stop("Package 'paws' is required for S3 access. Install it with install.packages('paws').")
+}
+
 # Functions
-source("functions_WS.R")
-source("functions_S3.R")
+source("/app/scripts/functions_WS.R")
+source("/app/scripts/functions_S3.R")
+
+# ---------------------------------------------------------------------------
+# Parameter loader — reads from the PARAMS file supplied via the PARAMS env var
+# ---------------------------------------------------------------------------
+load_params <- function() {
+  params_file <- Sys.getenv("PARAMS", unset = "/app/scripts/PARAMS")
+  if (!file.exists(params_file)) {
+    stop(sprintf(
+      "Parameters file not found: %s  (set PARAMS env var to override)",
+      params_file
+    ))
+  }
+
+  lines <- readLines(params_file, warn = FALSE)
+  lines <- trimws(lines)
+  lines <- lines[nchar(lines) > 0 & !startsWith(lines, "#")]
+
+  raw <- list()
+  for (line in lines) {
+    idx <- regexpr("=", line, fixed = TRUE)
+    if (idx < 1) {
+      warning(sprintf("Skipping malformed line in params file: %s", line))
+      next
+    }
+    key        <- trimws(substr(line, 1, idx - 1))
+    value      <- trimws(substr(line, idx + 1, nchar(line)))
+    raw[[key]] <- value
+  }
+
+  get_str <- function(key, default = NULL) {
+    v <- raw[[key]]
+    if (is.null(v) || v == "" || v == "NULL") return(default)
+    v
+  }
+  get_vec <- function(key, default = NULL) {
+    v <- raw[[key]]
+    if (is.null(v) || v == "" || v == "NULL") return(default)
+    as.integer(trimws(strsplit(v, ",")[[1]]))
+  }
+
+  list(
+    months_to_process = get_vec("months_to_process", default = 1:12),
+    rc_list_s3_key    = get_str("rc_list_s3_key",    default = ""),
+    bpns_s3_prefix    = get_str("bpns_s3_prefix",    default = "")
+  )
+}
+
+p <- load_params()
 
 # Simple timing helpers for section-level runtime reporting
 timings <- data.frame(section = character(), seconds = numeric(), stringsAsFactors = FALSE)
@@ -28,13 +80,22 @@ script_t0 <- tic("Total runtime")
 #########################################
 # Preparations -----------------------------------------------------------------
 t0 <- tic("Preparations")
-setwd("/app")
 
-# Local staging directories (ephemeral — data is pulled from S3 and results pushed back)
-input_dir      <- "/tmp/mussel-model/input"
-output_dir     <- "/tmp/mussel-model/output"
+# Fixed container-internal directories
+scripts_dir <- "/app/scripts"
+input_dir   <- "/app/input"
+output_dir  <- "/app/output"
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (!dir.exists(scripts_dir)) stop(sprintf("scripts_dir not found: %s", scripts_dir))
+if (!dir.exists(input_dir))   stop(sprintf("input_dir not found: %s",   input_dir))
+
 rc_list_path   <- file.path(input_dir, "rc_list_year.rds")
 bpns_input_dir <- file.path(input_dir, "BPNS input layers median")
+
+# Parameters from PARAMS file
+months_to_process <- p$months_to_process
 
 # S3 settings
 s3_input_prefix  <- Sys.getenv("S3_INPUT_PREFIX", "input")
@@ -49,7 +110,7 @@ ensure_rc_list_available <- function(path) {
     return(TRUE)
   }
 
-  override_key <- Sys.getenv("RC_LIST_S3_KEY", "")
+  override_key <- if (nzchar(p$rc_list_s3_key)) p$rc_list_s3_key else Sys.getenv("RC_LIST_S3_KEY", "")
   keys <- unique(Filter(nzchar, c(
     override_key,
     safe_s3_key(s3_input_prefix, basename(path)),
@@ -73,7 +134,7 @@ ensure_bpns_inputs_available <- function(dir_path) {
     return(TRUE)
   }
 
-  bpns_prefix_override <- Sys.getenv("BPNS_S3_PREFIX", "")
+  bpns_prefix_override <- if (nzchar(p$bpns_s3_prefix)) p$bpns_s3_prefix else Sys.getenv("BPNS_S3_PREFIX", "")
   dir.create(dir_path, recursive = TRUE, showWarnings = FALSE)
 
   for (fname in missing) {
@@ -111,7 +172,7 @@ if (!ensure_bpns_inputs_available(bpns_input_dir)) {
 }
 toc("Ensure required input files", t0)
 
-months_to_process <- 1:12
+# months_to_process is loaded from PARAMS via load_params() above
 
 # create response curves ----------------------
 t0 <- tic("Load response curves")
