@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Entrypoint: syncs the S3_SCRIPTS_PREFIX folder from S3 (including PARAMS),

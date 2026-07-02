@@ -23,10 +23,17 @@ WORKDIR /app
 
 RUN mkdir -p /app/output /app/input /app/scripts
 
-RUN R -q -e "install.packages(c('Rcpp','FuzzyR','raster','terra','doSNOW','foreach','iterators','sp','paws'), repos='https://cloud.r-project.org')"
+# Pin to a dated CRAN snapshot (via Posit Package Manager) instead of the
+# rolling 'latest' CRAN mirror, so a rebuild months from now doesn't silently
+# pick up different package versions and change model output.
+RUN R -q -e "install.packages(c('Rcpp','FuzzyR','raster','terra','sp','paws'), repos='https://packagemanager.posit.co/cran/2024-03-15')"
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+RUN groupadd --system app && useradd --system --gid app --home-dir /app app \
+    && chown -R app:app /app
+USER app
 
 ENV SCRIPT_NAME=VSC_CB2_HSM_18.R \
     S3_SCRIPTS_PREFIX=scripts \

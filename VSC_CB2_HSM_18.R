@@ -2,8 +2,6 @@
 library(FuzzyR)
 library(raster)
 library(terra)
-library(doSNOW)
-library(foreach)
 
 if (!requireNamespace("paws", quietly = TRUE)) {
   stop("Package 'paws' is required for S3 access. Install it with install.packages('paws').")
@@ -60,6 +58,13 @@ load_params <- function() {
 }
 
 p <- load_params()
+
+if (anyNA(p$months_to_process) || any(!(p$months_to_process %in% 1:12))) {
+  stop(sprintf(
+    "Invalid 'months_to_process' in PARAMS file: %s (must be integers 1-12)",
+    paste(p$months_to_process, collapse = ",")
+  ))
+}
 
 # Simple timing helpers for section-level runtime reporting
 timings <- data.frame(section = character(), seconds = numeric(), stringsAsFactors = FALSE)
@@ -125,9 +130,9 @@ ensure_rc_list_available <- function(path) {
   FALSE
 }
 
-ensure_bpns_inputs_available <- function(dir_path) {
+ensure_bpns_inputs_available <- function(dir_path, months) {
   expected_layers <- c(1, 2, 3, 4, 5, 7, 8, 9, 10)
-  expected_files <- as.vector(outer(1:12, expected_layers, function(m, l) sprintf("BPNS_%d_%d.tif", m, l)))
+  expected_files <- as.vector(outer(months, expected_layers, function(m, l) sprintf("BPNS_%d_%d.tif", m, l)))
 
   missing <- expected_files[!file.exists(file.path(dir_path, expected_files))]
   if (length(missing) == 0) {
@@ -167,7 +172,7 @@ t0 <- tic("Ensure required input files")
 if (!ensure_rc_list_available(rc_list_path)) {
   stop(paste("RC_LIST_PATH file not found locally or in S3:", rc_list_path))
 }
-if (!ensure_bpns_inputs_available(bpns_input_dir)) {
+if (!ensure_bpns_inputs_available(bpns_input_dir, months_to_process)) {
   stop(paste("BPNS_INPUT_DIR is missing required files locally and in S3:", bpns_input_dir))
 }
 toc("Ensure required input files", t0)
@@ -194,7 +199,7 @@ t0 <- tic("Load and preprocess BPNS data")
 folder <- if (grepl("[/\\]$", bpns_input_dir)) bpns_input_dir else paste0(bpns_input_dir, "/")
 
 BPNS <- NULL
-BPNS <- food_for_HSM(folder)
+BPNS <- food_for_HSM(folder, months_to_process)
 
 BPNS_aggr <- NULL
 for (i in months_to_process) {
@@ -230,15 +235,21 @@ results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
   }, mc.cores = n_cores)
 }
 names(results_HSM_Cpp) <- as.character(months_to_process)
+
+# mclapply returns a try-error object per element on worker failure instead of
+# raising, so failures must be checked explicitly before writing output.
+failed <- months_to_process[vapply(results_HSM_Cpp, function(x) inherits(x, "try-error"), logical(1))]
+if (length(failed) > 0) {
+  stop(sprintf("HSM calculation failed for month(s): %s", paste(failed, collapse = ", ")))
+}
 toc("Run monthly HSM calculations", t0)
 
 t0 <- tic("Write raster outputs")
 for (i in months_to_process) {
-# for (i in 1) {
   if (!dir.exists(output_dir)) {
     dir.create(output_dir, recursive = TRUE)
   }
-  writeRaster(results_HSM_Cpp[[i]], filename = file.path(output_dir, paste0("BPNS_", i, ".tif")),
+  writeRaster(results_HSM_Cpp[[as.character(i)]], filename = file.path(output_dir, paste0("BPNS_", i, ".tif")),
               format = "GTiff", overwrite = TRUE)
 }
 toc("Write raster outputs", t0)
