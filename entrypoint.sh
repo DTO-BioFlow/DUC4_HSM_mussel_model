@@ -30,7 +30,7 @@ if [[ -z "${SCRIPT_NAME:-}" ]]; then
     exit 1
 fi
 
-S3_BUCKET="${AWS_S3_Bucket_Name:-}"
+S3_BUCKET="${AWS_S3_BUCKET_NAME:-}"
 if [[ -z "${S3_BUCKET:-}" ]]; then
     echo "Error: S3_BUCKET is not set."
     exit 1
