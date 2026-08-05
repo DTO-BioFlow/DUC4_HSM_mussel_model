@@ -5,10 +5,70 @@
 # Unused/legacy helper functions have been moved to functions_WS_legacy.R
 # (not sourced by the pipeline, not uploaded to the S3 scripts/ prefix).
 
-fun9999 <- function(x) { x[is.na(x)] <- -9999; return(x)} # function to change NA to -9999 to work in fuzzy logic
+# function to change NA to -9999 to work in fuzzy logic. -9999 must match
+# evalfis_cpp2()'s na_sentinel default (pkg/fuzzyfis/src/evalfis2.cpp) - that
+# function recognizes this exact value as "missing" independent of each
+# variable's configured range, so this sentinel and that default must stay
+# in sync if either one is ever changed.
+fun9999 <- function(x) { x[is.na(x)] <- -9999; return(x)}
 
 # CRS shared by the BPNS input layers that don't carry it in their own metadata
 BPNS_CRS <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+
+#########################################
+##      Container-aware CPU count      ##
+#########################################
+# parallel::detectCores() reports the HOST's CPU count, not the container's
+# cgroup quota - on a resource-limited container (e.g. EDITO) this can badly
+# oversubscribe mclapply workers versus what's actually available, risking
+# thrashing/OOM. These helpers read the cgroup CPU quota when present so the
+# worker count reflects what the container actually has.
+
+# Returns an integer core limit from the cgroup CPU quota, or NA_integer_ if
+# no limit is set/readable (e.g. not running under cgroups, or unlimited).
+get_container_cpu_limit <- function() {
+  # cgroup v2: single file "<quota> <period>", quota "max" means unlimited
+  path_v2 <- "/sys/fs/cgroup/cpu.max"
+  if (file.exists(path_v2)) {
+    line <- tryCatch(readLines(path_v2, n = 1, warn = FALSE), error = function(e) NA_character_)
+    if (length(line) == 1 && !is.na(line)) {
+      parts <- strsplit(trimws(line), "\\s+")[[1]]
+      if (length(parts) == 2 && parts[1] != "max") {
+        quota <- suppressWarnings(as.numeric(parts[1]))
+        period <- suppressWarnings(as.numeric(parts[2]))
+        if (!is.na(quota) && !is.na(period) && period > 0) {
+          return(max(1L, as.integer(floor(quota / period))))
+        }
+      }
+    }
+  }
+
+  # cgroup v1: quota/period in separate files; quota -1 means unlimited
+  quota_path  <- "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+  period_path <- "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
+  if (file.exists(quota_path) && file.exists(period_path)) {
+    quota  <- suppressWarnings(as.numeric(tryCatch(readLines(quota_path, n = 1, warn = FALSE), error = function(e) NA)))
+    period <- suppressWarnings(as.numeric(tryCatch(readLines(period_path, n = 1, warn = FALSE), error = function(e) NA)))
+    if (!is.na(quota) && quota > 0 && !is.na(period) && period > 0) {
+      return(max(1L, as.integer(floor(quota / period))))
+    }
+  }
+
+  NA_integer_
+}
+
+# Resolves the worker count to use: an explicit override always wins;
+# otherwise host cores capped by the cgroup limit (if any), minus one,
+# floored at 1.
+resolve_worker_count <- function(override = NA_integer_) {
+  if (!is.na(override) && override > 0) {
+    return(as.integer(override))
+  }
+  host_cores <- parallel::detectCores()
+  cgroup_limit <- get_container_cpu_limit()
+  n <- if (!is.na(cgroup_limit)) min(host_cores, cgroup_limit) else host_cores
+  max(1L, as.integer(n) - 1L)
+}
 
 food_for_HSM <- function(folder, months = 1:12) { # create this functions to load BPNS maps
 
@@ -602,9 +662,19 @@ hsm_calc_year_cpp2 <- function(df, j, fis, out_disc = 301) {
 
 
 # install.packages("Rcpp")  # if needed
-library(Rcpp)
+#
+# Legacy evalfis_cpp is compiled lazily (call install_legacy_evalfis_cpp()),
+# not at source() time: it is unused by the production pipeline (superseded
+# by evalfis_cpp2 in the fuzzyfis package), and source()-ing this file runs
+# at the start of every single container run - compiling ~200 lines of C++
+# on every run for a function nobody calls would be pure wasted time. Kept
+# available (not deleted) as a manual reference/fallback until the new path
+# has been validated in production; tests/test_evalfis_cpp2.R calls this
+# explicitly to get the old function as its trusted-baseline comparison.
+install_legacy_evalfis_cpp <- function() {
+  library(Rcpp)
 
-cppFunction('
+  cppFunction('
 #include <Rcpp.h>
 using namespace Rcpp;
 
@@ -807,3 +877,4 @@ NumericVector evalfis_cpp(NumericMatrix input, List fis, int out_disc = 201) {
   return result;
 }
 ')
+}

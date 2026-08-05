@@ -1,7 +1,6 @@
 # packages really needed
 library(FuzzyR)
 library(raster)
-library(terra)
 library(fuzzyfis)
 
 if (!requireNamespace("paws", quietly = TRUE)) {
@@ -75,6 +74,9 @@ load_params <- function() {
     weight      = as.numeric(get_str("rule_weight",      default = "0.5"))
   )
 
+  n_cores_str <- get_str("n_cores", default = "")
+  n_cores_override <- if (nzchar(n_cores_str)) as.integer(n_cores_str) else NA_integer_
+
   list(
     months_to_process = get_vec("months_to_process", default = 1:12),
     rc_list_s3_key    = get_str("rc_list_s3_key",    default = ""),
@@ -82,7 +84,8 @@ load_params <- function() {
     out_disc          = as.integer(get_str("out_disc", default = "301")),
     parameters        = p_parameters,
     ranges            = ranges,
-    rule_thresholds   = rule_thresholds
+    rule_thresholds   = rule_thresholds,
+    n_cores           = n_cores_override
   )
 }
 
@@ -254,8 +257,15 @@ t0 <- tic("Run monthly HSM calculations")
 #   print(paste0("Processing month: ", j))
 #   results_HSM_Cpp[[j]] <- hsm_calc_year_cpp(BPNS_aggr2, j, 301)
 # }
-n_cores <- max(1, parallel::detectCores() - 1)
-cat(">>> Worker count:", n_cores, "\n")
+n_cores <- resolve_worker_count(p$n_cores)
+cgroup_limit <- get_container_cpu_limit()
+cat(sprintf(
+  ">>> Worker count: %d (host cores=%s, cgroup limit=%s, override=%s)\n",
+  n_cores,
+  parallel::detectCores(),
+  if (is.na(cgroup_limit)) "none" else cgroup_limit,
+  if (is.na(p$n_cores)) "none" else p$n_cores
+))
 results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
   lapply(months_to_process, function(j) {
     cat("Processing month:", j, "\n")

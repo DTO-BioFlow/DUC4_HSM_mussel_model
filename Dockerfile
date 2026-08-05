@@ -26,7 +26,7 @@ RUN mkdir -p /app/output /app/input /app/scripts
 # Pin to a dated CRAN snapshot (via Posit Package Manager) instead of the
 # rolling 'latest' CRAN mirror, so a rebuild months from now doesn't silently
 # pick up different package versions and change model output.
-RUN R -q -e "install.packages(c('Rcpp','FuzzyR','raster','terra','sp','paws'), repos='https://packagemanager.posit.co/cran/2024-03-15')"
+RUN R -q -e "install.packages(c('Rcpp','FuzzyR','raster','sp','paws'), repos='https://packagemanager.posit.co/cran/2024-03-15')"
 
 # --- fuzzyfis: internal compiled FIS evaluator, built into the image -------
 # Unlike the R scripts (synced from S3 at container startup), this package's

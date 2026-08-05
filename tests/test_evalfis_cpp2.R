@@ -37,7 +37,12 @@ if (requireNamespace("fuzzyfis", quietly = TRUE)) {
 }
 
 library(FuzzyR)
-source(file.path(repo_root, "functions_WS.R"))   # brings in the OLD evalfis_cpp (cppFunction) as trusted baseline
+source(file.path(repo_root, "functions_WS.R"))
+# The old evalfis_cpp is compiled lazily (install_legacy_evalfis_cpp(), see
+# functions_WS.R) rather than at source() time, so the production pipeline
+# never pays its compile cost. This dev-only test explicitly wants it as the
+# trusted baseline, so it opts in here.
+install_legacy_evalfis_cpp()
 
 # ---------------------------------------------------------------------------
 # Harness
@@ -262,6 +267,34 @@ for (om in c("max", "probor")) {
   bad_mf$input[[1]]$mf[[1]]$type <- "sigmf"
   record("stop() on unsupported MF type",
          expect_error(evalfis_cpp2(default_inputs[1, , drop = FALSE], bad_mf)))
+
+  # x1 only has 3 MFs (low/med/high); a rule referencing index 4 is malformed
+  # and must be rejected up front, not cause an out-of-bounds access deep in
+  # the per-cell loop.
+  bad_rule_index <- make_synthetic_fis()
+  bad_rule_index$rule[1, 1] <- 4
+  record("stop() on rule referencing out-of-bounds antecedent MF index",
+         expect_error(evalfis_cpp2(default_inputs[1, , drop = FALSE], bad_rule_index)))
+}
+
+# ---------------------------------------------------------------------------
+# Case 7: na_sentinel (-9999) must be treated as a non-match by explicit
+# value, not merely because it happens to fall outside a variable's
+# configured MF domain. Regression test for the PARAMS range_<code> /
+# -9999 collision risk: widens x1's 'low' MF shoulder far below the
+# sentinel (mirroring what build_fuzzy_logic_model_yearrc2 does with a
+# range_<code> override) and confirms evalfis_cpp2 still excludes it.
+# ---------------------------------------------------------------------------
+{
+  fis <- make_synthetic_fis()
+  fis$input[[1]]$mf[[1]]$params <- c(-20000, -20000, 2, 4) # 'low' now spans down to -20000
+
+  sentinel_input <- rbind(c(-9999, 1)) # x1 = na_sentinel; x2 = low (both would fire rule 1 if x1 weren't guarded)
+  out <- evalfis_cpp2(sentinel_input, fis, out_disc = 301)
+
+  record("na_sentinel treated as non-match even inside a widened MF domain",
+         is.na(out[1]),
+         sprintf("expected NA (no rule should fire), got %s", paste(round(out, 3), collapse = ",")))
 }
 
 # ---------------------------------------------------------------------------

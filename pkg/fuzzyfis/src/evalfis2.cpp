@@ -20,6 +20,14 @@ using namespace Rcpp;
 //     discretized point) instead of being recomputed for every raster cell -
 //     this was the dominant redundant cost in the original implementation.
 //   - MF-type dispatch uses an enum instead of repeated string comparisons.
+//   - Antecedent MF indices in the rule table are bounds-checked once up
+//     front (not per cell) - a malformed rule table raises a clear R error
+//     instead of causing an out-of-bounds vector access.
+//   - Missing input values (na_sentinel, default -9999, matching fun9999()
+//     in functions_WS.R) are recognized by explicit value check rather than
+//     relying on them simply falling outside each variable's configured
+//     range - so a PARAMS range_<code> override can't accidentally turn a
+//     missing cell into a real "extreme" reading.
 //
 // Index conventions (matches FuzzyR):
 //   - Rule matrix MF indices are 1-based in R; converted to 0-based via `-1`
@@ -142,7 +150,8 @@ static double reduce_or(const std::vector<double>& mus, OrMethod om) {
 }
 
 // [[Rcpp::export]]
-NumericVector evalfis_cpp2(NumericMatrix input, List fis, int out_disc = 301) {
+NumericVector evalfis_cpp2(NumericMatrix input, List fis, int out_disc = 301,
+                            double na_sentinel = -9999.0) {
   int n = input.nrow();
   if (n == 0) return NumericVector(0);
   int nin = input.ncol();
@@ -181,6 +190,24 @@ NumericVector evalfis_cpp2(NumericMatrix input, List fis, int out_disc = 301) {
       parsed.type = parse_mf_type(as<std::string>(mf["type"]));
       parsed.params = as<NumericVector>(mf["params"]);
       in_mfs[i].push_back(parsed);
+    }
+  }
+
+  // --- validate the rule table once, up front, instead of inside the hot
+  // per-cell loop below: every non-"don't care" antecedent MF index must
+  // actually exist for that input variable. A malformed rule table (e.g. a
+  // hand-edited spec_rules override) would otherwise cause an out-of-bounds
+  // vector access deep in the per-row loop - undefined behavior - instead of
+  // a clean, early R-level error. ---
+  for (int r = 0; r < nrules; r++) {
+    for (int j = 0; j < nin; j++) {
+      int mf_index = (int) rules(r, j) - 1;
+      if (mf_index < 0) continue; // don't care
+      if (mf_index >= (int) in_mfs[j].size()) {
+        stop("Rule " + std::to_string(r + 1) + " references MF index " + std::to_string(mf_index + 1) +
+             " for input variable " + std::to_string(j + 1) + ", which only has " +
+             std::to_string(in_mfs[j].size()) + " MF(s) defined");
+      }
     }
   }
 
@@ -231,7 +258,14 @@ NumericVector evalfis_cpp2(NumericMatrix input, List fis, int out_disc = 301) {
       for (int j = 0; j < nin; j++) {
         int mf_index = (int) rules(r, j) - 1; // 1-based -> 0-based; -1 = don't care
         if (mf_index < 0) continue;
-        double mu = mf_eval2(input(irow, j), in_mfs[j][mf_index]);
+        double x = input(irow, j);
+        // na_sentinel marks a missing raster cell (see fun9999() in
+        // functions_WS.R). Treated as a guaranteed non-match against every
+        // real MF by explicit value check, regardless of that variable's
+        // configured range - unlike relying on the sentinel simply falling
+        // outside the range, this can't be broken by a PARAMS range_<code>
+        // override that happens to widen the domain to include it.
+        double mu = (x == na_sentinel) ? 0.0 : mf_eval2(x, in_mfs[j][mf_index]);
         mus.push_back(mu);
         if (conn == 1 && mu <= 0.0) { and_short_circuit = true; break; }
       }
