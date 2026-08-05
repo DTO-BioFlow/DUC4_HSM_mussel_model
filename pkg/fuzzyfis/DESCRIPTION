@@ -1,0 +1,15 @@
+Package: fuzzyfis
+Type: Package
+Title: Compiled Mamdani Fuzzy Inference Evaluator for the Mussel HSM Pipeline
+Version: 0.1.0
+Description: Internal, project-only package providing evalfis_cpp2(), a
+    compiled replacement for the ad hoc cppFunction() block previously
+    embedded in functions_WS.R. Not published or intended for reuse outside
+    this project. Built into the Docker image at image-build time (see
+    Dockerfile) rather than compiled at container startup - changing
+    src/evalfis2.cpp requires an image rebuild, unlike the R scripts, which
+    are synced from S3 at runtime.
+Encoding: UTF-8
+Imports: Rcpp
+LinkingTo: Rcpp
+License: Unlimited

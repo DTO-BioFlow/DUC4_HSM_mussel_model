@@ -300,6 +300,306 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
   return(fis_list)
 }
 
+#########################################
+##      Fuzzy logic (new, v2)          ##
+#########################################
+# New, parallel implementation alongside build_fuzzy_logic_model_yearrc /
+# hsm_calc_year_cpp / evalfis_cpp above, which are left untouched as a
+# fallback/reference until the new path (this section + evalfis_cpp2 in the
+# fuzzyfis package) has been validated in production. See
+# tests/test_evalfis_cpp2.R and README.md ("Old vs. New FIS Implementation").
+
+# Default input-variable ranges, matching the values hardcoded in
+# build_fuzzy_logic_model_yearrc (several were marked "# to adjust" there -
+# now PARAMS-overridable via range_<code> keys, see VSC_CB2_HSM_18.R).
+DEFAULT_MF_RANGES <- list(
+  temp  = c(-10, 40),
+  sal   = c(0, 45),
+  oxy   = c(0, 50),
+  sub   = c(0, 200),
+  sed   = c(-2, 2),
+  cur   = c(0, 5),
+  orb   = c(0, 5),
+  chl   = c(0, 60),
+  shear = c(0, 5)
+)
+
+# Default rule-generation thresholds, matching the values hardcoded in
+# build_fuzzy_logic_model_yearrc. cutoff_bad/okay/good are fractions (0-1) of
+# parameters in the "optimal" state that determine each rule's response
+# class; weight is the flat weight applied to every generated rule.
+DEFAULT_RULE_THRESHOLDS <- list(
+  cutoff_bad  = 0.50,
+  cutoff_okay = 0.70,
+  cutoff_good = 0.90,
+  weight      = 0.5
+)
+
+build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
+                                             ranges = DEFAULT_MF_RANGES,
+                                             rule_thresholds = DEFAULT_RULE_THRESHOLDS) {
+  # create list to store monthly fis
+  fis_list <- NULL
+
+  # to list by month
+  month <- c("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+  # Create a fis (Fuzzy inference system)
+  musselbed <- NULL # start fresh
+
+  musselbed <- newfis(
+    'musselbed_',
+    fisType = "mamdani", #sugeno uses average weight
+    mfType = "t1",
+    andMethod = "prod",
+    orMethod = "max",
+    impMethod = "min",
+    aggMethod = "max",
+    defuzzMethod = "centroid"
+  )
+
+  #######################
+  # Add input variables #
+  #######################
+  # 1.  Temperature -------------------------------------------------------------------------------------------------------------------------
+  if ("temp" %in% params){
+    musselbed <- addvar(
+      musselbed,
+      'input', #input or output
+      "temperature",
+      seq(ranges$temp[1], ranges$temp[2]),
+      method = NULL,
+      params = NULL,
+      firing.method = "tnorm.min.max"
+    )
+    # Add membership function (mf)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "temp"), 'optimal', 'trapmf', rc_list$sst$q)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "temp"), 'low', 'trapmf', c(ranges$temp[1],ranges$temp[1],rc_list$sst$q[1],rc_list$sst$q[2]))
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "temp"), 'high', 'trapmf', c(rc_list$sst$q[3],rc_list$sst$q[4],ranges$temp[2],ranges$temp[2]))
+  }
+
+
+  # 2.  Salinity -------------------------------------------------------------------------------------------------------------------------
+  if ("sal" %in% params){
+    musselbed <- addvar(
+      musselbed,
+      'input', #input or output
+      "salinity",
+      seq(ranges$sal[1], ranges$sal[2]),
+      method = NULL,
+      params = NULL,
+      firing.method = "tnorm.min.max"
+    )
+    # Add membership function (mf)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sal"), 'optimal', 'trapmf', rc_list$sss$q)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sal"), 'low', 'trapmf', c(ranges$sal[1],ranges$sal[1],rc_list$sss$q[1],rc_list$sss$q[2]))
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sal"), 'high', 'trapmf', c(rc_list$sss$q[3],rc_list$sss$q[4],ranges$sal[2],ranges$sal[2]))
+  }
+
+  # 3.  Dissolved Oxygen concentration ---> NOT ENOUGH DATA for monthly -------------------------------------------------------------------------------------------------------------------------
+  if ("oxy" %in% params){
+    musselbed <- addvar(
+      musselbed,
+      'input', #input or output
+      "Oxy",
+      seq(ranges$oxy[1], ranges$oxy[2]),
+      method = NULL,
+      params = NULL,
+      firing.method = "tnorm.min.max"
+    )
+    # Add membership function (mf)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "oxy"), 'optimal', 'trapmf', rc_list$oxy$q)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "oxy"), 'low', 'trapmf', c(ranges$oxy[1],ranges$oxy[1],rc_list$oxy$q[1],rc_list$oxy$q[2]))
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "oxy"), 'high', 'trapmf', c(rc_list$oxy$q[3],rc_list$oxy$q[4],ranges$oxy[2],ranges$oxy[2]))
+  }
+
+  # 4.  Substrate -------------------------------------------------------------------------------------------------------------------------
+  if ("sub" %in% params){
+    musselbed <- addvar(
+      musselbed,
+      'input', #input or output
+      "substrate",
+      seq(ranges$sub[1], ranges$sub[2]),
+      method = NULL,
+      params = NULL,
+      firing.method = "tnorm.min.max"
+    )
+    # Add membership function (mf)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sub"), 'optimal', 'trimf', rc_list$substrate$q)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sub"), 'low', 'trapmf', c(ranges$sub[1],ranges$sub[1],rc_list$substrate$q[1],rc_list$substrate$q[2]))
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sub"), 'high', 'trapmf', c(rc_list$substrate$q[2],rc_list$substrate$q[3],ranges$sub[2],ranges$sub[2]))
+  }
+
+  # 5.  Sedimentation rate -------------------------------------------------------------------------------------------------------------------------
+  if ("sed" %in% params){
+    musselbed <- addvar(
+      musselbed,
+      'input', #input or output
+      "sedimentation",
+      seq(ranges$sed[1], ranges$sed[2]),
+      method = NULL,
+      params = NULL,
+      firing.method = "tnorm.min.max"
+    )
+    # Add membership function (mf)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sed"), 'optimal', 'trimf', rc_list$sedimentation$q)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sed"), 'low', 'trapmf', c(ranges$sed[1],ranges$sed[1],rc_list$sedimentation$q[1],rc_list$sedimentation$q[2]))
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sed"), 'high', 'trapmf', c(rc_list$sedimentation$q[2],rc_list$sedimentation$q[3],ranges$sed[2],ranges$sed[2]))
+  }
+
+  # 6.  Current speed -------------------------------------------------------------------------------------------------------------------------
+  if ("cur" %in% params){
+    musselbed <- addvar(
+      musselbed,
+      'input', #input or output
+      "current speed",
+      seq(ranges$cur[1], ranges$cur[2]),
+      method = NULL,
+      params = NULL,
+      firing.method = "tnorm.min.max"
+    )
+    # Add membership function (mf)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "cur"), 'optimal', 'trapmf', rc_list$current_speed$q)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "cur"), 'low', 'trapmf', c(ranges$cur[1],ranges$cur[1],rc_list$current_speed$q[1],rc_list$current_speed$q[2]))
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "cur"), 'high', 'trapmf', c(rc_list$current_speed$q[3],rc_list$current_speed$q[4],ranges$cur[2],ranges$cur[2]))
+  }
+
+  # 7.  Orbital velocity -------------------------------------------------------------------------------------------------------------------------
+  if ("orb" %in% params){
+    musselbed <- addvar(
+      musselbed,
+      'input', #input or output
+      "orbital velocity",
+      seq(ranges$orb[1], ranges$orb[2]),
+      method = NULL,
+      params = NULL,
+      firing.method = "tnorm.min.max"
+    )
+    # Add membership function (mf)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "orb"), 'optimal', 'trimf', rc_list$orb_vel$q)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "orb"), 'low', 'trapmf', c(ranges$orb[1],ranges$orb[1],rc_list$orb_vel$q[1],rc_list$orb_vel$q[2]))
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "orb"), 'high', 'trapmf', c(rc_list$orb_vel$q[2],rc_list$orb_vel$q[3],ranges$orb[2],ranges$orb[2]))
+  }
+
+  # 8. Primary Production (PP) -------------------------------------------------------------------------------------------------------------------------
+  if ("chl" %in% params){
+    musselbed <- addvar(
+      musselbed,
+      'input', #input or output
+      "PP",
+      seq(ranges$chl[1], ranges$chl[2]),
+      method = NULL,
+      params = NULL,
+      firing.method = "tnorm.min.max"
+    )
+    # Add membership function (mf)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "chl"), 'optimal', 'trapmf', rc_list$PP$q)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "chl"), 'low', 'trapmf', c(ranges$chl[1],ranges$chl[1],rc_list$PP$q[1],rc_list$PP$q[2]))
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "chl"), 'high', 'trapmf', c(rc_list$PP$q[3],rc_list$PP$q[4],ranges$chl[2],ranges$chl[2]))
+  }
+
+
+  # 9.  Shear stress -------------------------------------------------------------------------------------------------------------------------
+  if ("shear" %in% params){
+    musselbed <- addvar(
+      musselbed,
+      'input', #input or output
+      "shear stress",
+      seq(ranges$shear[1], ranges$shear[2]),
+      method = NULL,
+      params = NULL,
+      firing.method = "tnorm.min.max"
+    )
+    # Add membership function (mf)
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "shear"), 'optimal', 'trimf', rc_list$shear$q) # N/m² : from Smile Consult in German Bight
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "shear"), 'low', 'trapmf', c(ranges$shear[1],ranges$shear[1],rc_list$shear$q[1],rc_list$shear$q[2]))
+    musselbed <- addmf(musselbed, 'input', which(parameters %in% "shear"), 'high', 'trapmf', c(rc_list$shear$q[2],rc_list$shear$q[3],ranges$shear[2],ranges$shear[2]))
+  }
+
+
+  ########################
+  # Add output variables #
+  ########################
+  # 1.  Suitability -------------------------------------------------------------------------------------------------------------------------
+  # Output scale/breakpoints are NOT parameterized - they define the model's
+  # output scale itself, not an input calibration knob.
+  musselbed <- addvar(
+    musselbed,
+    'output', #input or output
+    "Suitability",
+    c(0:100),
+    method = NULL,
+    params = NULL,
+    firing.method = "tnorm.min.max"
+  )
+  # Add membership function (mf)
+  musselbed <- addmf(musselbed, 'output', 1, 'optimal', 'trapmf', c(80,85,100,100))
+  musselbed <- addmf(musselbed, 'output', 1, 'good', 'trapmf', c(65,70,80,85))
+  musselbed <- addmf(musselbed, 'output', 1, 'okay', 'trapmf', c(25,50,65,70))
+  musselbed <- addmf(musselbed, 'output', 1, 'bad', 'trapmf', c(0,0,25,50))
+
+  ###################
+  # Add fuzzy rules #
+  ###################
+  # load monthly fuzzy rules -------------------------------------------------------------------------------------------------------------------------
+  rulelist <- expand.grid(c(rep(list(c(1:3)), length(params)))) #use combinations to have all possible scenario's
+  rulelist <- as.data.frame(sapply(rulelist, function(x) as.numeric(x)))
+  rulelist$response <- NA # add response column
+  rulelist$weight <- NA # add response column
+  rulelist$and_or <- NA # add AND/OR column
+
+  frac_optimal <- rowSums(rulelist[,c(1:length(params))] == 1) / length(params)
+  # NOTE: the original build_fuzzy_logic_model_yearrc computed the upper
+  # bound of the middle two bands (okay/good) over columns
+  # 1:(length(params)-1) instead of 1:length(params) - one column short of
+  # what the lower bound uses. That looks like a copy/paste bug, but it is
+  # reproduced here EXACTLY (via frac_optimal_upper below) so this function's
+  # default output matches the old function's output bit-for-bit. Fixing it
+  # is a separate, deliberate follow-up - not part of this refactor.
+  frac_optimal_upper <- rowSums(rulelist[,c(1:(length(params)-1))] == 1) / length(params)
+  rulelist$response[which(frac_optimal <  rule_thresholds$cutoff_bad)] <- 4
+  rulelist$response[which(frac_optimal >= rule_thresholds$cutoff_bad  & frac_optimal_upper < rule_thresholds$cutoff_okay)] <- 3
+  rulelist$response[which(frac_optimal >= rule_thresholds$cutoff_okay & frac_optimal_upper < rule_thresholds$cutoff_good)] <- 2
+  rulelist$response[which(frac_optimal >= rule_thresholds$cutoff_good)] <- 1
+  rulelist$weight <- rule_thresholds$weight # weight for rule
+  rulelist$and_or <- 1 # provide AND/OR column
+
+  if (!is.null(spec_rules)){
+    # remove unnecessary rules
+    for (j in 1:length(spec_rules)){
+      p <- which(spec_rules[[j]][1:length(params)] != 0)
+      rulelist <- rulelist[-which(rulelist[,p] == spec_rules[[j]][p]),]
+    }
+    # NOTE: fixed vs. the old function, which referenced an undefined global
+    # `specif_rules_month` here (dead code today since spec_rules/
+    # specif_rules_year is always NULL in production) - uses this function's
+    # own `spec_rules` parameter instead.
+    extra_rules <-t(as.data.frame(spec_rules))
+    colnames(extra_rules) <-  colnames(rulelist)
+    rulelist2 <- rbind(rulelist,extra_rules)
+  } else {
+    rulelist2 <- rulelist
+  }
+  musselbed <- addrule(musselbed, as.matrix(rulelist2)) # add rules to fis
+
+  fis_list <- musselbed
+  return(fis_list)
+}
+
+hsm_calc_year_cpp2 <- function(df, j, fis, out_disc = 301) {
+  # df: list of monthly raster stacks; j: month index
+  # fis: FuzzyR fis object (explicit parameter, unlike hsm_calc_year_cpp
+  # which reads a fuzzy_model_year global from the calling scope)
+  rstack <- df[[j]]                 # the multi-layer raster (stack/brick)
+  vals <- getValues(rstack)         # matrix: n rows (cells) x p columns (parameters)
+
+  out <- evalfis_cpp2(vals, fis, out_disc)  # from the fuzzyfis package (library(fuzzyfis))
+
+  hsm <- raster(rstack)             # template
+  hsm <- setValues(hsm, out)        # assign suitability values
+  return(hsm)
+}
+
 
 # install.packages("Rcpp")  # if needed
 library(Rcpp)

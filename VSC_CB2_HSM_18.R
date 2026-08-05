@@ -2,6 +2,7 @@
 library(FuzzyR)
 library(raster)
 library(terra)
+library(fuzzyfis)
 
 if (!requireNamespace("paws", quietly = TRUE)) {
   stop("Package 'paws' is required for S3 access. Install it with install.packages('paws').")
@@ -49,11 +50,39 @@ load_params <- function() {
     if (is.null(v) || v == "" || v == "NULL") return(default)
     as.integer(trimws(strsplit(v, ",")[[1]]))
   }
+  get_str_vec <- function(key, default = NULL) {
+    v <- raw[[key]]
+    if (is.null(v) || v == "" || v == "NULL") return(default)
+    trimws(strsplit(v, ",")[[1]])
+  }
+
+  p_parameters <- get_str_vec("parameters", default = c("temp", "sal", "oxy", "sub", "sed", "cur", "orb", "chl", "shear"))
+
+  # Per-parameter MF ranges: one range_<code> PARAMS key per entry in
+  # p_parameters, falling back to DEFAULT_MF_RANGES (functions_WS.R) so
+  # behavior is unchanged unless explicitly overridden.
+  ranges <- setNames(
+    lapply(p_parameters, function(code) {
+      get_vec(paste0("range_", code), default = DEFAULT_MF_RANGES[[code]])
+    }),
+    p_parameters
+  )
+
+  rule_thresholds <- list(
+    cutoff_bad  = as.numeric(get_str("rule_cutoff_bad",  default = "0.50")),
+    cutoff_okay = as.numeric(get_str("rule_cutoff_okay", default = "0.70")),
+    cutoff_good = as.numeric(get_str("rule_cutoff_good", default = "0.90")),
+    weight      = as.numeric(get_str("rule_weight",      default = "0.5"))
+  )
 
   list(
     months_to_process = get_vec("months_to_process", default = 1:12),
     rc_list_s3_key    = get_str("rc_list_s3_key",    default = ""),
-    bpns_s3_prefix    = get_str("bpns_s3_prefix",    default = "")
+    bpns_s3_prefix    = get_str("bpns_s3_prefix",    default = ""),
+    out_disc          = as.integer(get_str("out_disc", default = "301")),
+    parameters        = p_parameters,
+    ranges            = ranges,
+    rule_thresholds   = rule_thresholds
   )
 }
 
@@ -187,11 +216,15 @@ toc("Load response curves", t0)
 
 # build fuzzy logic model ----------------------
 t0 <- tic("Build fuzzy logic model")
-parameters <- c("temp", "sal", "oxy", "sub", "sed", "cur", "orb", "chl", "shear")
+parameters <- p$parameters
 
 specif_rules_year <- NULL
 
-fuzzy_model_year <- build_fuzzy_logic_model_yearrc(parameters, specif_rules_year)
+fuzzy_model_year <- build_fuzzy_logic_model_yearrc2(
+  parameters, specif_rules_year,
+  ranges = p$ranges,
+  rule_thresholds = p$rule_thresholds
+)
 toc("Build fuzzy logic model", t0)
 
 # load HSM input data (raster shape)
@@ -226,12 +259,12 @@ cat(">>> Worker count:", n_cores, "\n")
 results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
   lapply(months_to_process, function(j) {
     cat("Processing month:", j, "\n")
-    hsm_calc_year_cpp(BPNS_aggr2, j, 301)
+    hsm_calc_year_cpp2(BPNS_aggr2, j, fuzzy_model_year, p$out_disc)
   })
 } else {
   parallel::mclapply(months_to_process, function(j) {
     cat("Processing month:", j, "\n")
-    hsm_calc_year_cpp(BPNS_aggr2, j, 301)
+    hsm_calc_year_cpp2(BPNS_aggr2, j, fuzzy_model_year, p$out_disc)
   }, mc.cores = n_cores)
 }
 names(results_HSM_Cpp) <- as.character(months_to_process)

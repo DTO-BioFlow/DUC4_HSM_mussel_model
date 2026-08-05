@@ -1,0 +1,5 @@
+# Generated/maintained by Rcpp::compileAttributes(); regenerated at Docker
+# build time (see Dockerfile). This checked-in copy is a valid starting point
+# so the package structure is complete even before compileAttributes() runs.
+useDynLib(fuzzyfis, .registration = TRUE)
+export(evalfis_cpp2)
