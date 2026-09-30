@@ -57,51 +57,139 @@ get_container_cpu_limit <- function() {
   NA_integer_
 }
 
-# Resolves the worker count to use: an explicit override always wins;
-# otherwise host cores capped by the cgroup limit (if any), minus one,
-# floored at 1.
-resolve_worker_count <- function(override = NA_integer_) {
-  if (!is.na(override) && override > 0) {
-    return(as.integer(override))
-  }
-  host_cores <- parallel::detectCores()
-  cgroup_limit <- get_container_cpu_limit()
-  n <- if (!is.na(cgroup_limit)) min(host_cores, cgroup_limit) else host_cores
-  max(1L, as.integer(n) - 1L)
+#########################################
+##    Container-aware memory budget    ##
+#########################################
+# Each worker loads, aggregates and NA-converts one full-resolution month
+# (9 layers x ~27 M cells) before running the HSM, so the worker count must
+# also respect the memory the container actually has (review R1-06/R2-12) -
+# a CPU-only count (19 workers on a 20-core host) could OOM a pod whose
+# memory limit is far smaller than its CPU count suggests.
+
+# Reads one line from a cgroup/proc file as a number; NA if the file is
+# missing or unreadable (I/O boundary - falls back to "unknown").
+read_number_file <- function(path) {
+  if (!file.exists(path)) return(NA_real_)
+  line <- tryCatch(readLines(path, n = 1, warn = FALSE), error = function(e) NA_character_)
+  if (length(line) != 1 || is.na(line)) return(NA_real_)
+  suppressWarnings(as.numeric(trimws(line)))
 }
 
-food_for_HSM <- function(folder, months = 1:12) { # create this functions to load BPNS maps
+# Returns the bytes still available under the container's cgroup memory
+# limit (limit - current usage), or NA if no limit is set/readable.
+# Paths are arguments so tests can point them at fixture files.
+get_container_memory_available <- function(
+    v2_max     = "/sys/fs/cgroup/memory.max",
+    v2_current = "/sys/fs/cgroup/memory.current",
+    v1_limit   = "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    v1_usage   = "/sys/fs/cgroup/memory/memory.usage_in_bytes") {
+  # cgroup v2: memory.max is "max" when unlimited (read_number_file -> NA)
+  limit <- read_number_file(v2_max)
+  usage <- read_number_file(v2_current)
+  if (is.na(limit)) {
+    # cgroup v1: "unlimited" is a page-aligned INT64_MAX (~9.2e18)
+    limit <- read_number_file(v1_limit)
+    usage <- read_number_file(v1_usage)
+    if (!is.na(limit) && limit >= 2^60) limit <- NA_real_
+  }
+  if (is.na(limit)) return(NA_real_)
+  max(0, limit - if (is.na(usage)) 0 else usage)
+}
 
-  for (i in months) {
-    BPNS_sst <- raster(file.path(folder, sprintf("BPNS_%d_1.tif", i)))
-    BPNS_sss <- raster(file.path(folder, sprintf("BPNS_%d_2.tif", i)))
-    BPNS_chl <- raster(file.path(folder, sprintf("BPNS_%d_3.tif", i)))
-    BPNS_oxy <- raster(file.path(folder, sprintf("BPNS_%d_4.tif", i)))
-    BPNS_orbvel <- raster(file.path(folder, sprintf("BPNS_%d_5.tif", i)))
-    #BPNS_depth <- raster(file.path(folder, sprintf("BPNS_%d_6.tif", i)))
-    BPNS_sedrate <- raster(file.path(folder, sprintf("BPNS_%d_7.tif", i)))
-    crs(BPNS_sedrate) <- BPNS_CRS
-    BPNS_substrate <- raster(file.path(folder, sprintf("BPNS_%d_8.tif", i)))
-    crs(BPNS_substrate) <- BPNS_CRS
-    BPNS_currentvel <- raster(file.path(folder, sprintf("BPNS_%d_9.tif", i)))
-    BPNS_shear <- raster(file.path(folder, sprintf("BPNS_%d_10.tif", i)))
-    crs(BPNS_shear) <- BPNS_CRS
+# Returns MemAvailable from /proc/meminfo in bytes, or NA if unreadable.
+# Inside a container this is the host's (VM's) figure, not the cgroup's.
+get_host_memory_available <- function(meminfo = "/proc/meminfo") {
+  if (!file.exists(meminfo)) return(NA_real_)
+  lines <- tryCatch(readLines(meminfo, warn = FALSE), error = function(e) character(0))
+  hit <- grep("^MemAvailable:", lines, value = TRUE)
+  if (length(hit) != 1) return(NA_real_)
+  kb <- suppressWarnings(as.numeric(strsplit(trimws(hit), "\\s+")[[1]][2]))
+  if (is.na(kb)) NA_real_ else kb * 1024
+}
 
-    BPNS_1 <- addLayer(BPNS_sst,BPNS_sss,BPNS_oxy,BPNS_substrate,BPNS_sedrate,BPNS_currentvel,BPNS_orbvel,BPNS_chl,BPNS_shear)
+# Memory the workers may use, in bytes: the tighter of the cgroup headroom
+# and the host's MemAvailable (a cgroup limit can exceed what an
+# overcommitted node really has free), or NA if neither is known.
+get_available_memory <- function(container = get_container_memory_available(),
+                                 host = get_host_memory_available()) {
+  known <- c(container, host)[!is.na(c(container, host))]
+  if (length(known) == 0) NA_real_ else min(known)
+}
 
-    names(BPNS_1) <- c('temp',
-                       'sal',
-                       'oxy',
-                       'substrate',
-                       'sedrate',
-                       'currentvel',
-                       'orbvel',
-                       'chl',
-                       'shear')
-    BPNS[[i]] <-  BPNS_1
+# Resolves the worker count to use. Returns a list:
+#   n        - worker count (integer >= 1)
+#   limit    - which cap was binding: "override", "cpu", "memory" or "jobs"
+#   mem_cap  - workers that fit in available memory (NA if memory unknown)
+#   available_mem - the memory figure used, in bytes (NA if unknown)
+# An explicit override always wins (it is the user's deliberate choice), but
+# a line is printed when it exceeds the memory cap. Otherwise the count is
+# the tightest of: host cores capped by the cgroup CPU limit minus one,
+# floor(available memory / mem_per_worker_gb), and the number of jobs;
+# floored at 1. The detection inputs are arguments so tests can inject them.
+resolve_worker_count <- function(override = NA_integer_,
+                                 mem_per_worker_gb,
+                                 n_jobs,
+                                 host_cores = parallel::detectCores(),
+                                 cpu_limit = get_container_cpu_limit(),
+                                 available_mem = get_available_memory()) {
+  mem_cap <- if (is.na(available_mem)) NA_integer_ else
+    max(1L, as.integer(floor(available_mem / (mem_per_worker_gb * 1024^3))))
+
+  if (!is.na(override) && override > 0) {
+    if (!is.na(mem_cap) && override > mem_cap) {
+      cat(sprintf(
+        ">>> WARNING: n_cores=%d exceeds the memory-based cap of %d worker(s) (%.1f GB available / %.2f GB per worker) - workers may be OOM-killed\n",
+        as.integer(override), mem_cap, available_mem / 1024^3, mem_per_worker_gb
+      ))
+    }
+    return(list(n = as.integer(override), limit = "override", mem_cap = mem_cap, available_mem = available_mem))
   }
 
-  return(BPNS)
+  n_cpu <- if (!is.na(cpu_limit)) min(host_cores, cpu_limit) else host_cores
+  caps <- c(cpu = max(1L, as.integer(n_cpu) - 1L),
+            memory = mem_cap,
+            jobs = max(1L, as.integer(n_jobs)))
+  caps <- caps[!is.na(caps)]
+  binding <- names(caps)[which.min(caps)]
+  list(n = unname(caps[binding]), limit = binding, mem_cap = mem_cap, available_mem = available_mem)
+}
+
+# Loads one month's 9 BPNS input layers as a named RasterStack (full
+# resolution, file-backed - nothing is read into memory yet).
+load_bpns_month <- function(folder, i) {
+  BPNS_sst <- raster(file.path(folder, sprintf("BPNS_%d_1.tif", i)))
+  BPNS_sss <- raster(file.path(folder, sprintf("BPNS_%d_2.tif", i)))
+  BPNS_chl <- raster(file.path(folder, sprintf("BPNS_%d_3.tif", i)))
+  BPNS_oxy <- raster(file.path(folder, sprintf("BPNS_%d_4.tif", i)))
+  BPNS_orbvel <- raster(file.path(folder, sprintf("BPNS_%d_5.tif", i)))
+  #BPNS_depth <- raster(file.path(folder, sprintf("BPNS_%d_6.tif", i)))
+  BPNS_sedrate <- raster(file.path(folder, sprintf("BPNS_%d_7.tif", i)))
+  crs(BPNS_sedrate) <- BPNS_CRS
+  BPNS_substrate <- raster(file.path(folder, sprintf("BPNS_%d_8.tif", i)))
+  crs(BPNS_substrate) <- BPNS_CRS
+  BPNS_currentvel <- raster(file.path(folder, sprintf("BPNS_%d_9.tif", i)))
+  BPNS_shear <- raster(file.path(folder, sprintf("BPNS_%d_10.tif", i)))
+  crs(BPNS_shear) <- BPNS_CRS
+
+  BPNS_1 <- addLayer(BPNS_sst,BPNS_sss,BPNS_oxy,BPNS_substrate,BPNS_sedrate,BPNS_currentvel,BPNS_orbvel,BPNS_chl,BPNS_shear)
+
+  names(BPNS_1) <- c('temp',
+                     'sal',
+                     'oxy',
+                     'substrate',
+                     'sedrate',
+                     'currentvel',
+                     'orbvel',
+                     'chl',
+                     'shear')
+  return(BPNS_1)
+}
+
+# Full per-month preprocessing: load, aggregate 10x10 (mean), then replace
+# NA with the -9999 sentinel (fun9999). Runs inside each parallel worker, so
+# only one full-resolution month is in flight per worker (review R1-06).
+prepare_bpns_month <- function(folder, i) {
+  calc(stack(aggregate(load_bpns_month(folder, i), fact = 10)), fun9999)
 }
 
 hsm_calc_year_cpp <- function(df, j, out_disc = 201) {
@@ -670,11 +758,11 @@ log_out_of_range_cells <- function(vals, fis, month, na_sentinel = -9999) {
   }
 }
 
-hsm_calc_year_cpp2 <- function(df, j, fis, out_disc = 301) {
-  # df: list of monthly raster stacks; j: month index
+hsm_calc_year_cpp2 <- function(rstack, j, fis, out_disc = 301) {
+  # rstack: one month's preprocessed multi-layer raster (prepare_bpns_month);
+  # j: month index, used only for logging
   # fis: FuzzyR fis object (explicit parameter, unlike hsm_calc_year_cpp
   # which reads a fuzzy_model_year global from the calling scope)
-  rstack <- df[[j]]                 # the multi-layer raster (stack/brick)
   vals <- getValues(rstack)         # matrix: n rows (cells) x p columns (parameters)
 
   log_out_of_range_cells(vals, fis, j)

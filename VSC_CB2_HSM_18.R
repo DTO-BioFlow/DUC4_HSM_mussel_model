@@ -77,6 +77,15 @@ load_params <- function() {
   n_cores_str <- get_str("n_cores", default = "")
   n_cores_override <- if (nzchar(n_cores_str)) as.integer(n_cores_str) else NA_integer_
 
+  # Memory one worker needs to preprocess + evaluate one month; caps the
+  # worker count (resolve_worker_count in functions_WS.R). Default: see the
+  # mem_per_worker_gb row in README "Run Parameters".
+  mem_per_worker_str <- get_str("mem_per_worker_gb", default = "1.5")
+  mem_per_worker_gb  <- suppressWarnings(as.numeric(mem_per_worker_str))
+  if (is.na(mem_per_worker_gb) || mem_per_worker_gb <= 0) {
+    stop(sprintf("Invalid 'mem_per_worker_gb' in PARAMS file: %s (must be a positive number of GB)", mem_per_worker_str))
+  }
+
   list(
     months_to_process = get_vec("months_to_process", default = 1:12),
     rc_list_s3_key    = get_str("rc_list_s3_key",    default = ""),
@@ -85,7 +94,8 @@ load_params <- function() {
     parameters        = p_parameters,
     ranges            = ranges,
     rule_thresholds   = rule_thresholds,
-    n_cores           = n_cores_override
+    n_cores           = n_cores_override,
+    mem_per_worker_gb = mem_per_worker_gb
   )
 }
 
@@ -230,52 +240,43 @@ fuzzy_model_year <- build_fuzzy_logic_model_yearrc2(
 )
 toc("Build fuzzy logic model", t0)
 
-# load HSM input data (raster shape)
-t0 <- tic("Load and preprocess BPNS data")
+# Load, preprocess and evaluate each month inside its own worker ------------
+# Preprocessing (load 9 layers, aggregate 10x10, NA -> -9999) used to run
+# serially for all months before the parallel phase and dominated the
+# runtime (review R1-06: 758 of 857 s). Each worker now handles one whole
+# month, so the worker count is capped by memory as well as CPUs (R2-12).
+t0 <- tic("Preprocess + HSM per month (parallel)")
 folder <- if (grepl("[/\\]$", bpns_input_dir)) bpns_input_dir else paste0(bpns_input_dir, "/")
 
-BPNS <- NULL
-BPNS <- food_for_HSM(folder, months_to_process)
-
-BPNS_aggr <- NULL
-for (i in months_to_process) {
-  BPNS_aggr[[i]] <- aggregate(BPNS[[i]], fact = 10)
+process_month <- function(j) {
+  cat("Processing month:", j, "\n")
+  hsm_calc_year_cpp2(prepare_bpns_month(folder, j), j, fuzzy_model_year, p$out_disc)
 }
 
-# changing NA to -9999 to work with fuzzy logic
-BPNS_aggr2 <- NULL
-for (i in months_to_process) {
-  BPNS_aggr2[[i]] <- calc(stack(BPNS_aggr[[i]]), fun9999)
-}
-toc("Load and preprocess BPNS data", t0)
-
-# Apply fuzzy logic model
-t0 <- tic("Run monthly HSM calculations")
-# results_HSM_Cpp <- list()
-# for (j in 1:12) {
-# # for (j in 1:1) {
-#   print(paste0("Processing month: ", j))
-#   results_HSM_Cpp[[j]] <- hsm_calc_year_cpp(BPNS_aggr2, j, 301)
-# }
-n_cores <- resolve_worker_count(p$n_cores)
+workers <- resolve_worker_count(p$n_cores, p$mem_per_worker_gb, length(months_to_process))
+n_cores <- workers$n
 cgroup_limit <- get_container_cpu_limit()
 cat(sprintf(
-  ">>> Worker count: %d (host cores=%s, cgroup limit=%s, override=%s)\n",
+  ">>> Worker count: %d, limited by %s (host cores=%s, cgroup CPU limit=%s, available memory=%s GB, per worker=%.2f GB -> memory cap=%s, months=%d, override=%s)\n",
   n_cores,
+  workers$limit,
   parallel::detectCores(),
   if (is.na(cgroup_limit)) "none" else cgroup_limit,
+  if (is.na(workers$available_mem)) "unknown" else sprintf("%.1f", workers$available_mem / 1024^3),
+  p$mem_per_worker_gb,
+  if (is.na(workers$mem_cap)) "none" else workers$mem_cap,
+  length(months_to_process),
   if (is.na(p$n_cores)) "none" else p$n_cores
 ))
+# mc.preschedule = FALSE forks one short-lived child per month: each month's
+# full-resolution working memory is released as soon as that month is done
+# (a prescheduled child would run several months in one long-lived process),
+# and months of uneven cost are balanced across workers.
 results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
-  lapply(months_to_process, function(j) {
-    cat("Processing month:", j, "\n")
-    hsm_calc_year_cpp2(BPNS_aggr2, j, fuzzy_model_year, p$out_disc)
-  })
+  lapply(months_to_process, process_month)
 } else {
-  parallel::mclapply(months_to_process, function(j) {
-    cat("Processing month:", j, "\n")
-    hsm_calc_year_cpp2(BPNS_aggr2, j, fuzzy_model_year, p$out_disc)
-  }, mc.cores = n_cores)
+  parallel::mclapply(months_to_process, process_month,
+                     mc.cores = n_cores, mc.preschedule = FALSE)
 }
 names(results_HSM_Cpp) <- as.character(months_to_process)
 
@@ -287,7 +288,7 @@ failed <- months_to_process[vapply(results_HSM_Cpp, function(x) inherits(x, "try
 if (length(failed) > 0) {
   stop(sprintf("HSM calculation failed for month(s): %s", paste(failed, collapse = ", ")))
 }
-toc("Run monthly HSM calculations", t0)
+toc("Preprocess + HSM per month (parallel)", t0)
 
 t0 <- tic("Write raster outputs")
 for (i in months_to_process) {
