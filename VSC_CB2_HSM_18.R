@@ -280,8 +280,10 @@ results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
 names(results_HSM_Cpp) <- as.character(months_to_process)
 
 # mclapply returns a try-error object per element on worker failure instead of
-# raising, so failures must be checked explicitly before writing output.
-failed <- months_to_process[vapply(results_HSM_Cpp, function(x) inherits(x, "try-error"), logical(1))]
+# raising, so failures must be checked explicitly before writing output. A
+# worker killed by the OS (e.g. OOM) leaves NULL in its slot instead - not a
+# try-error - so that must be checked too (review R1-05).
+failed <- months_to_process[vapply(results_HSM_Cpp, function(x) inherits(x, "try-error") || is.null(x), logical(1))]
 if (length(failed) > 0) {
   stop(sprintf("HSM calculation failed for month(s): %s", paste(failed, collapse = ", ")))
 }
@@ -300,7 +302,13 @@ toc("Write raster outputs", t0)
 t0 <- tic("Upload outputs to S3")
 if (!is.null(s3_client) && nzchar(s3_bucket)) {
   cat(">>> Uploading output files to", paste0("s3://", s3_bucket, "/", s3_output_prefix), "\n")
-  upload_dir_to_s3(s3_client, s3_bucket, output_dir, s3_output_prefix)
+  failed_uploads <- upload_dir_to_s3(s3_client, s3_bucket, output_dir, s3_output_prefix)
+  # A failed upload must fail the job - otherwise the run exits 0 having
+  # silently lost results, since /app/output is not persisted anywhere else
+  # (review R1-04). upload_to_s3() already logged each failure's cause.
+  if (length(failed_uploads) > 0) {
+    stop(sprintf("S3 upload failed for %d file(s): %s", length(failed_uploads), paste(failed_uploads, collapse = ", ")))
+  }
   cat(">>> Upload complete\n")
 } else {
   cat(">>> Skipping S3 upload: no S3 client or bucket configured\n")
@@ -310,10 +318,3 @@ toc("Upload outputs to S3", t0)
 toc("Total runtime", script_t0)
 cat("\n>>> Timing summary (seconds):\n")
 print(timings)
-
-timing_file <- file.path(output_dir, "timing_summary.txt")
-writeLines(c(
-  ">>> Timing summary (seconds):",
-  capture.output(print(timings))
-), con = timing_file)
-cat(">>> Timing summary saved to", timing_file, "\n")

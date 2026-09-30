@@ -101,19 +101,29 @@ upload_to_s3 <- function(s3, bucket, local_path, s3_key) {
   ok
 }
 
+# Returns the S3 keys that failed to upload (character(0) if every upload
+# succeeded, including the "nothing to do" cases below - not configured, or
+# no local directory - which the caller already gates on before calling this,
+# so they are not failures). The caller must check this: upload_to_s3()
+# already reports each failure to the console, but silently continuing past a
+# failed upload would let the job exit 0 having lost results (review R1-04).
 upload_dir_to_s3 <- function(s3, bucket, local_dir, s3_prefix) {
   if (is.null(s3) || !nzchar(bucket) || !dir.exists(local_dir)) {
-    return(invisible(NULL))
+    return(character(0))
   }
 
   local_dir_norm <- normalizePath(local_dir, winslash = "/", mustWork = FALSE)
   files <- list.files(local_dir, recursive = TRUE, full.names = TRUE)
 
+  failed_keys <- character(0)
   for (f in files) {
     file_norm <- normalizePath(f, winslash = "/", mustWork = FALSE)
     prefix <- paste0(local_dir_norm, "/")
     rel <- if (startsWith(file_norm, prefix)) substring(file_norm, nchar(prefix) + 1) else basename(file_norm)
     key <- if (!nzchar(s3_prefix)) rel else safe_s3_key(s3_prefix, rel)
-    upload_to_s3(s3, bucket, f, key)
+    if (!upload_to_s3(s3, bucket, f, key)) {
+      failed_keys <- c(failed_keys, key)
+    }
   }
+  failed_keys
 }
