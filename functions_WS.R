@@ -646,12 +646,38 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
   return(fis_list)
 }
 
+log_out_of_range_cells <- function(vals, fis, month, na_sentinel = -9999) {
+  # evalfis_cpp2() clamps a real (non-sentinel) value outside its variable's
+  # declared range to the nearer bound rather than producing NA (review
+  # R2-03). That clamp is silent by design (it runs per rule, in a hot loop,
+  # once per raster cell); this is the observability half of that fix - a
+  # per-layer count of how many cells it actually affected, logged once per
+  # month so unusually noisy input data (e.g. the negative-oxygen cells found
+  # during the review) stays visible instead of only showing up as a slightly
+  # different suitability value.
+  for (k in seq_along(fis$input)) {
+    rng  <- fis$input[[k]]$range
+    col  <- vals[, k]
+    real <- !is.na(col) & col != na_sentinel
+    n_low  <- sum(real & col < rng[1])
+    n_high <- sum(real & col > rng[2])
+    if (n_low > 0 || n_high > 0) {
+      cat(sprintf(
+        ">>> Month %d: %s out of declared range [%.4g,%.4g] - %d cell(s) below (clamped to min), %d cell(s) above (clamped to max)\n",
+        month, fis$input[[k]]$name, rng[1], rng[2], n_low, n_high
+      ))
+    }
+  }
+}
+
 hsm_calc_year_cpp2 <- function(df, j, fis, out_disc = 301) {
   # df: list of monthly raster stacks; j: month index
   # fis: FuzzyR fis object (explicit parameter, unlike hsm_calc_year_cpp
   # which reads a fuzzy_model_year global from the calling scope)
   rstack <- df[[j]]                 # the multi-layer raster (stack/brick)
   vals <- getValues(rstack)         # matrix: n rows (cells) x p columns (parameters)
+
+  log_out_of_range_cells(vals, fis, j)
 
   out <- evalfis_cpp2(vals, fis, out_disc)  # from the fuzzyfis package (library(fuzzyfis))
 

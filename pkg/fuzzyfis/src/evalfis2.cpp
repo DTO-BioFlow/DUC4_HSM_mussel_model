@@ -28,6 +28,18 @@ using namespace Rcpp;
 //     relying on them simply falling outside each variable's configured
 //     range - so a PARAMS range_<code> override can't accidentally turn a
 //     missing cell into a real "extreme" reading.
+//   - A degenerate MF shoulder (trapmf/trimf with a==b or c==d - what every
+//     "low"/"high" input MF and every output MF this model builds actually
+//     is) now evaluates to 1 exactly at that boundary point, matching
+//     FuzzyR's own trapmf/trimf (review R2-03). Previously it evaluated to 0
+//     there, so a cell landing exactly on a variable's configured range bound
+//     (or the output centroid grid's own endpoints) got zero membership from
+//     every set and the result was NA.
+//   - A real (non-sentinel) input value outside its variable's declared range
+//     is clamped to the nearer bound before evaluation, instead of left to
+//     miss every MF and produce NA (review R2-03). This is a deliberate
+//     modeling policy, not FuzzyR-equivalent behavior: FuzzyR itself does not
+//     clamp and would also give 0 membership (NA output) there.
 //
 // Index conventions (matches FuzzyR):
 //   - Rule matrix MF indices are 1-based in R; converted to 0-based via `-1`
@@ -90,19 +102,39 @@ static DefuzzMethod parse_defuzz_method(const std::string& s) {
   stop("Unsupported defuzzMethod (only 'centroid' is implemented): " + s);
 }
 
+// Matches FuzzyR's own trapmf/trimf (R, not exported: FuzzyR:::trapmf /
+// FuzzyR:::trimf), which compute e.g. y <- pmax(pmin((x-a)/(b-a), h,
+// (d-x)/(d-c)), 0) and then replace NaN (from a 0/0 division, i.e. a
+// degenerate shoulder with a==b or c==d evaluated exactly at that point) with
+// h=1. mf_eval2 below reproduces that in closed form instead of relying on
+// IEEE NaN propagation: a degenerate shoulder (a==b, resp. c==d) evaluates to
+// 1 exactly AT the boundary and 0 strictly outside it, same as everywhere
+// else in a non-degenerate MF. This fixes review finding R2-03: this model
+// builds every "low"/"high" input MF as a degenerate shoulder
+// (c(min,min,q1,q2) / c(q3,q4,max,max) - see build_fuzzy_logic_model_yearrc2
+// in functions_WS.R) and every output MF the same way at the universe ends
+// (0/100) - a raster cell landing exactly on a variable's configured range
+// bound, or the output centroid grid's own endpoints, used to get zero
+// membership from every set. Non-degenerate MFs (a<b, c<d) are unaffected:
+// the added a==b / c==d checks only ever change behaviour exactly at x==a or
+// x==d when the shoulder is degenerate.
 static double mf_eval2(double x, const MF& mf) {
   const NumericVector& p = mf.params;
   switch (mf.type) {
     case MFType::TRIMF: {
       double a = p[0], b = p[1], c = p[2];
-      if (x <= a || x >= c) return 0.0;
+      if (x < a || x > c) return 0.0;
+      if (x == a) return (a == b) ? 1.0 : 0.0;
+      if (x == c) return (b == c) ? 1.0 : 0.0;
       if (x == b) return 1.0;
       if (x < b) return (x - a) / (b - a);
       return (c - x) / (c - b);
     }
     case MFType::TRAPMF: {
       double a = p[0], b = p[1], c = p[2], d = p[3];
-      if (x <= a || x >= d) return 0.0;
+      if (x < a || x > d) return 0.0;
+      if (x == a) return (a == b) ? 1.0 : 0.0;
+      if (x == d) return (c == d) ? 1.0 : 0.0;
       if (x >= b && x <= c) return 1.0;
       if (x < b) return (x - a) / (b - a);
       return (d - x) / (d - c);
@@ -177,8 +209,13 @@ NumericVector evalfis_cpp2(NumericMatrix input, List fis, int out_disc = 301,
     stop("Number of input columns does not match fis$input length");
   }
 
-  // --- parse input MFs once (not per row/rule) ---
+  // --- parse input MFs and each input variable's own declared range once
+  // (not per row/rule). The range is what addvar()'s varBounds argument sets
+  // (FuzzyR stores just [min,max] there, not the full sequence) - the same
+  // range a PARAMS range_<code> override configures
+  // (build_fuzzy_logic_model_yearrc2 in functions_WS.R). ---
   std::vector<std::vector<MF>> in_mfs(nin);
+  std::vector<double> in_range_min(nin), in_range_max(nin);
   for (int i = 0; i < nin; i++) {
     List invar = inputs[i];
     List mf_list = invar["mf"];
@@ -191,6 +228,9 @@ NumericVector evalfis_cpp2(NumericMatrix input, List fis, int out_disc = 301,
       parsed.params = as<NumericVector>(mf["params"]);
       in_mfs[i].push_back(parsed);
     }
+    NumericVector rng = as<NumericVector>(invar["range"]);
+    in_range_min[i] = rng[0];
+    in_range_max[i] = rng[1];
   }
 
   // --- validate the rule table once, up front, instead of inside the hot
@@ -264,8 +304,28 @@ NumericVector evalfis_cpp2(NumericMatrix input, List fis, int out_disc = 301,
         // real MF by explicit value check, regardless of that variable's
         // configured range - unlike relying on the sentinel simply falling
         // outside the range, this can't be broken by a PARAMS range_<code>
-        // override that happens to widen the domain to include it.
-        double mu = (x == na_sentinel) ? 0.0 : mf_eval2(x, in_mfs[j][mf_index]);
+        // override that happens to widen the domain to include it. Checked
+        // BEFORE clamping below, so a sentinel is never mistaken for a real
+        // out-of-range reading even if it numerically falls inside the
+        // variable's configured range.
+        double mu;
+        if (x == na_sentinel) {
+          mu = 0.0;
+        } else {
+          // A real value outside this variable's declared range (data noise,
+          // a sensor artifact, or an unclamped upstream value - e.g. review
+          // R2-03's negative-oxygen cells) is clamped to the nearer bound
+          // before evaluation, rather than left to fall outside every MF and
+          // produce NA. This is a deliberate modeling choice, not something
+          // FuzzyR::evalfis() itself does (verified: FuzzyR gives 0
+          // membership, i.e. NA output, for a value beyond the range too) -
+          // review R2-03. Counting/logging how many cells this affects is
+          // done by the R caller (hsm_calc_year_cpp2 in functions_WS.R),
+          // which has the raw values before this clamp is applied.
+          if (x < in_range_min[j]) x = in_range_min[j];
+          else if (x > in_range_max[j]) x = in_range_max[j];
+          mu = mf_eval2(x, in_mfs[j][mf_index]);
+        }
         mus.push_back(mu);
         if (conn == 1 && mu <= 0.0) { and_short_circuit = true; break; }
       }

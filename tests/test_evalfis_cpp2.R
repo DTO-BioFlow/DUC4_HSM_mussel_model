@@ -89,6 +89,13 @@ record_xfail <- function(case, bug_present, detail = "") {
 }
 
 close_enough <- function(a, b, tol = 1e-9) {
+  # unname() both sides: evalfis_cpp2() always returns an unnamed vector,
+  # but a FuzzyR reference computed via apply() over a row-named input
+  # matrix (e.g. prod_cells, which is named for readability) carries those
+  # rownames into its result - identical() on is.na(a) vs is.na(b) then
+  # compares names too and spuriously reports "not equal" even when every
+  # value matches exactly. Only the values, not the names, define parity.
+  a <- unname(a); b <- unname(b)
   if (length(a) != length(b)) return(FALSE)
   if (!identical(is.na(a), is.na(b))) return(FALSE)
   all(is.na(a) | abs(a - b) <= tol)
@@ -148,8 +155,19 @@ make_fis <- function(andMethod = "prod", orMethod = "max", impMethod = "min",
 
   in_low  <- if (shoulders) c(0, 0, 2, 4)   else c(-1, 0, 2, 4)
   in_high <- if (shoulders) c(6, 8, 10, 10) else c(6, 8, 10, 11)
+  # evalfis_cpp2() clamps a real input value to the variable's declared
+  # range before evaluating it (review R2-03). The "interior" (shoulders =
+  # FALSE) MFs deliberately extend slightly past [0,10] (in_low/in_high
+  # above) so a value can sit inside an MF's own ramp without being exactly
+  # at a shoulder; its declared range must therefore be wide enough to
+  # bracket that ramp (and this file's whole input battery, out to +-5) or
+  # the clamp would silently reshape those ramps. The "edge" (shoulders =
+  # TRUE) FIS keeps range = [0,10] deliberately: that is what makes its
+  # low/high MFs degenerate AT the range bound, matching how
+  # build_fuzzy_logic_model_yearrc2 always builds them in production.
+  in_bounds <- if (shoulders) c(0, 10) else c(-20, 20)
   for (k in 1:2) {
-    fis <- addvar(fis, 'input', paste0("x", k), c(0:10), method = NULL, params = NULL, firing.method = "tnorm.min.max")
+    fis <- addvar(fis, 'input', paste0("x", k), in_bounds, method = NULL, params = NULL, firing.method = "tnorm.min.max")
     fis <- addmf(fis, 'input', k, 'low',  'trapmf', in_low)
     fis <- addmf(fis, 'input', k, 'med',  'trimf',  c(2, 5, 8))
     fis <- addmf(fis, 'input', k, 'high', 'trapmf', in_high)
@@ -232,41 +250,93 @@ record("orMethod='probor' changes the output",
 
 # ---------------------------------------------------------------------------
 # Section C: regression baseline against the old evalfis_cpp() on the
-# production-style ("edge") FIS. Both share the same MF code, so this proves
-# "no unintended change", not correctness. It is EXPECTED TO CHANGE in the
-# planned edge/out-of-range fix (F2) - update it deliberately then.
+# production-style ("edge") FIS, restricted to inputs that do NOT touch a
+# degenerate MF shoulder or fall outside a variable's range. Both
+# implementations share the same interior MF math, so equality here proves
+# "no unintended change" away from the F2 fix's actual target (correctness
+# AT the edges is checked directly against FuzzyR in section D below).
 # ---------------------------------------------------------------------------
-cat("\n--- C. Baseline vs old evalfis_cpp() (edge FIS; expected to change in F2) ---\n")
+cat("\n--- C. Baseline vs old evalfis_cpp() (edge FIS, interior inputs only) ---\n")
 edge_fis <- make_fis(shoulders = TRUE)
-for (case in list(list("default battery", inp), list("inputs exactly at the range ends", edge_inp))) {
-  new <- evalfis_cpp2(case[[2]], edge_fis, 301)
-  old <- evalfis_cpp(case[[2]], edge_fis, 301)
-  ok <- close_enough(new, old)
-  record(sprintf("baseline vs old evalfis_cpp(): %s", case[[1]]), ok,
-         if (!ok) sprintf("new=%s old=%s", fmt(new), fmt(old)) else "")
+interior_inp <- rbind(c(5, 5), c(3, 7), c(2, 2), c(4, 4), c(8, 8), c(5, 1), c(5, 9), c(1.5, 6.3), c(9.2, 0.7))
+{
+  # edge_fis's OUTPUT sets ('low'/'high') are always degenerate at 0/100 (the
+  # same production convention as its input shoulders), so R2-03b's fix
+  # changes the discretized centroid a little for basically any row through
+  # it - "interior" input (no edge, in range) does not exempt a row from
+  # that, it only rules out the INPUT-side half of the fix (R2-03a) and the
+  # clamp (D3). So a difference from the old evaluator here is expected;
+  # what must hold is that both sides still produce a valid, plausible
+  # value (no NA introduced, nothing wildly off) - correctness itself is
+  # checked against FuzzyR in section D (R2-03b fixed / interior_inp).
+  new <- evalfis_cpp2(interior_inp, edge_fis, 301)
+  old <- evalfis_cpp(interior_inp, edge_fis, 301)
+  record("interior battery through edge_fis: both valid, differ slightly from old (R2-03b's output-side fix, not edge/out-of-range-specific)",
+         !any(is.na(new)) && !any(is.na(old)) && !close_enough(new, old),
+         sprintf("new=%s old=%s", fmt(new), fmt(old)))
+}
+{
+  # At range-end/out-of-range inputs the F2 fix DELIBERATELY makes
+  # evalfis_cpp2 differ from the old, unfixed evalfis_cpp (which is left as
+  # is - review triage - and still returns NA there). This is not a
+  # regression: it is the fix. Correctness of the new value is checked
+  # against FuzzyR in section D.
+  new <- evalfis_cpp2(edge_inp, edge_fis, 301)
+  old <- evalfis_cpp(edge_inp, edge_fis, 301)
+  record("range-end inputs now differ from old evalfis_cpp() (fix is active) and old is still all-NA there",
+         !close_enough(new, old) && all(is.na(old)),
+         sprintf("new=%s old=%s", fmt(new), fmt(old)))
 }
 
 # ---------------------------------------------------------------------------
-# Section D: known defects (review R2-03) - asserted as XFAIL until fixed (F2)
+# Section D: R2-03 fix (F2) - degenerate MF shoulders and out-of-range clamp
 # ---------------------------------------------------------------------------
-cat("\n--- D. Known defects, expected failures until fixed (review R2-03) ---\n")
-ref_edge <- fuzzyr_ref(edge_inp, edge_fis, 101)
-new_edge <- evalfis_cpp2(edge_inp, edge_fis, 101)
-if (!is.null(ref_edge$error)) {
-  record("XFAIL setup: FuzzyR on range-end inputs", FALSE, ref_edge$error)
-} else {
-  record_xfail("R2-03a: input exactly at a range end gets zero membership -> NA (FuzzyR: valid value)",
-               all(is.na(new_edge)) && all(!is.na(ref_edge$value)),
-               sprintf("new=%s FuzzyR=%s", fmt(new_edge), fmt(ref_edge$value)))
+cat("\n--- D. R2-03 fix: degenerate MF shoulders and out-of-range clamping ---\n")
+
+# D1: an input landing exactly on a variable's range bound (a degenerate
+# input-MF shoulder) must now get a real value, matching FuzzyR exactly (its
+# trapmf/trimf already gave 1 there - see FuzzyR:::trapmf/FuzzyR:::trimf).
+parity_vs_fuzzyr("R2-03a fixed: input exactly at a range end matches FuzzyR", edge_fis, edge_inp)
+
+# D2: ordinary (non-edge, in-range - interior_inp, not inp: inp deliberately
+# contains out-of-range rows, which would pull in D3's clamp behavior too and
+# no longer isolate this check) inputs through an edge_fis (output sets
+# touching 0/100, a degenerate OUTPUT-MF shoulder) must also match FuzzyR now
+# - this isolates the output-side half of the fix from the input-side half
+# above. Note this output-side fix is NOT edge-case-only: it shifts the
+# discretized centroid a little for ANY cell whose result has some 'low' or
+# 'high' membership (i.e. most cells, in production) - see section C.
+parity_vs_fuzzyr("R2-03b fixed: output sets touching the universe ends (0/100) match FuzzyR", edge_fis, interior_inp)
+
+# D3: out-of-range clamping is a deliberate MODELING POLICY, not something
+# FuzzyR itself does (verified: FuzzyR gives 0 membership, i.e. NA output,
+# for a value beyond a variable's declared range too - it has no clamp).
+# So this is tested for self-consistency (clamped value == value evaluated
+# exactly at the boundary), not against FuzzyR.
+{
+  below_min <- rbind(c(-5, -5), c(-0.5, 10.5))   # x1 below range min (0)
+  at_min    <- rbind(c(0, 0),   c(0, 10))        # same rows, x1 clamped to min
+  above_max <- rbind(c(15, 15), c(10.5, -0.5))   # x1 above range max (10)
+  at_max    <- rbind(c(10, 10), c(10, 0))
+  out_below <- evalfis_cpp2(below_min, edge_fis, 301)
+  out_atmin <- evalfis_cpp2(at_min, edge_fis, 301)
+  out_above <- evalfis_cpp2(above_max, edge_fis, 301)
+  out_atmax <- evalfis_cpp2(at_max, edge_fis, 301)
+  record("clamp: value below range min gives the same result as the value AT the min",
+         close_enough(out_below, out_atmin),
+         sprintf("below=%s at_min=%s", fmt(out_below), fmt(out_atmin)))
+  record("clamp: value above range max gives the same result as the value AT the max",
+         close_enough(out_above, out_atmax),
+         sprintf("above=%s at_max=%s", fmt(out_above), fmt(out_atmax)))
 }
-ref_bias <- fuzzyr_ref(inp, edge_fis, 101)
-new_bias <- evalfis_cpp2(inp, edge_fis, 101)
-if (!is.null(ref_bias$error)) {
-  record("XFAIL setup: FuzzyR on edge FIS", FALSE, ref_bias$error)
-} else {
-  d <- max(abs(new_bias - ref_bias$value), na.rm = TRUE)
-  record_xfail("R2-03b: output sets starting/ending at 0/100 are dropped at the universe ends -> centroid differs from FuzzyR",
-               d > 1e-6, sprintf("max|diff| = %.4g", d))
+{
+  # The na_sentinel (-9999) must still short-circuit to NA even though it is
+  # numerically far below every variable's range - checked already in
+  # section E, repeated here explicitly against the clamp logic specifically
+  # (clamp must never be reached for a sentinel value).
+  out <- evalfis_cpp2(rbind(c(-9999, 5)), edge_fis, 301)
+  record("clamp does not apply to the na_sentinel value (still NA, not clamped to range min)",
+         is.na(out[1]), sprintf("got %s", fmt(out)))
 }
 
 # R2-18: aggMethod='sum' in evalfis_cpp2() is not equivalent to FuzzyR's.
@@ -405,35 +475,53 @@ record("builder: rule response classes optimal/good/okay/bad = 1/162/2688/16832 
 # Cells (one column per input, in FIS order temp,sal,oxy,sub,sed,cur,orb,chl,shear):
 # all inputs at the optimal plateau/peak; a mixed cell in the ramps; a cell
 # missing one layer (-9999 = NA sentinel) -> NA because every rule constrains
-# every variable.
+# every variable; a cell with temp exactly at its range min (-10, a
+# degenerate input-MF shoulder - review R2-03a); a cell with oxy below its
+# range min (-5, i.e. what the real negative-oxygen data found in review R3
+# looks like - review R2-03/clamp).
 prod_cells <- rbind(
-  optimal = c(11,   20,   9.5,  0.166, 0.2,  0.05, 0.256, 10,  0.355),
-  mixed   = c(9.8,  10,   8.5,  0.13,  0.0,  0.01, 0.20,  1.2, 0.20),
-  missing = c(11,   20,   9.5,  0.166, 0.2,  0.05, 0.256, 10,  -9999)
+  optimal   = c(11,   20,   9.5,  0.166, 0.2,  0.05, 0.256, 10,  0.355),
+  mixed     = c(9.8,  10,   8.5,  0.13,  0.0,  0.01, 0.20,  1.2, 0.20),
+  missing   = c(11,   20,   9.5,  0.166, 0.2,  0.05, 0.256, 10,  -9999),
+  temp_edge = c(-10,  20,   9.5,  0.166, 0.2,  0.05, 0.256, 10,  0.355),
+  oxy_below = c(11,   20,   -5,   0.166, 0.2,  0.05, 0.256, 10,  0.355)
 )
-new_prod <- evalfis_cpp2(prod_cells, prod_fis, 301)
-old_prod <- evalfis_cpp(prod_cells, prod_fis, 301)
-record("builder FIS: baseline vs old evalfis_cpp() (expected to change in F2)", close_enough(new_prod, old_prod),
-       sprintf("new=%s old=%s", fmt(new_prod), fmt(old_prod)))
-record("builder FIS: cell missing one layer gives NA, complete cells give a value",
-       is.na(new_prod[3]) && !any(is.na(new_prod[1:2])), sprintf("got %s", fmt(new_prod)))
-nan_cell <- prod_cells[1, , drop = FALSE]; nan_cell[1, 9] <- NaN
+# evalfis_cpp2() returns a plain, unnamed NumericVector - Rcpp does not carry
+# R rownames through automatically - so name it explicitly to index by row
+# label below instead of by a fragile positional index.
+new_prod <- setNames(evalfis_cpp2(prod_cells, prod_fis, 301), rownames(prod_cells))
+old_prod <- setNames(evalfis_cpp(prod_cells, prod_fis, 301), rownames(prod_cells))
+record("builder FIS: missing-layer cell (sentinel) gives NA in both old and new (unaffected by F2)",
+       is.na(new_prod["missing"]) && is.na(old_prod["missing"]),
+       sprintf("new=%s old=%s", fmt(new_prod["missing"]), fmt(old_prod["missing"])))
+record("builder FIS: optimal/mixed cells (no input edge, in range) both valid but differ slightly from old",
+       # Production's output MFs ('bad'/'optimal') are always degenerate at
+       # 0/100 (R2-03b), so this output-side fix changes EVERY cell's result
+       # a little, not just ones with an out-of-range or edge-of-range
+       # input - "interior" input alone does not exempt a cell from it.
+       # Correctness of the new value (not just "it differs") is checked
+       # against FuzzyR just below.
+       !close_enough(new_prod[c("optimal", "mixed")], old_prod[c("optimal", "mixed")]) &&
+         !any(is.na(new_prod[c("optimal", "mixed")])) && !any(is.na(old_prod[c("optimal", "mixed")])),
+       sprintf("new=%s old=%s", fmt(new_prod[c("optimal", "mixed")]), fmt(old_prod[c("optimal", "mixed")])))
+record("builder FIS: temp exactly at range min (R2-03a) now gives a value; old evaluator still NA",
+       !is.na(new_prod["temp_edge"]) && is.na(old_prod["temp_edge"]),
+       sprintf("new=%s old=%s", fmt(new_prod["temp_edge"]), fmt(old_prod["temp_edge"])))
+record("builder FIS: oxy below range min (R2-03 clamp) now gives a value; old evaluator still NA",
+       !is.na(new_prod["oxy_below"]) && is.na(old_prod["oxy_below"]),
+       sprintf("new=%s old=%s", fmt(new_prod["oxy_below"]), fmt(old_prod["oxy_below"])))
+nan_cell <- prod_cells["optimal", , drop = FALSE]; nan_cell[1, 9] <- NaN
 record("builder FIS: NaN in one layer gives NA (every rule constrains every variable)",
        is.na(evalfis_cpp2(nan_cell, prod_fis, 301)[1]))
 record("builder FIS: all-optimal cell scores higher than the mixed cell",
-       new_prod[1] > new_prod[2], sprintf("optimal=%s mixed=%s", fmt(new_prod[1]), fmt(new_prod[2])))
+       new_prod["optimal"] > new_prod["mixed"],
+       sprintf("optimal=%s mixed=%s", fmt(new_prod["optimal"]), fmt(new_prod["mixed"])))
 
-# Ground truth for the production FIS at its own grid (interior cells only).
-# The production output sets touch 0 and 100, so this also shows R2-03b.
-ref_prod <- fuzzyr_ref(prod_cells[1:2, , drop = FALSE], prod_fis, 101)
-if (!is.null(ref_prod$error)) {
-  record("XFAIL setup: FuzzyR on the production FIS", FALSE, ref_prod$error)
-} else {
-  new101 <- evalfis_cpp2(prod_cells[1:2, , drop = FALSE], prod_fis, 101)
-  d <- max(abs(new101 - ref_prod$value))
-  record_xfail("R2-03b on the production FIS: centroid differs from FuzzyR (output sets touch 0/100)",
-               d > 1e-6, sprintf("max|diff| = %.4g", d))
-}
+# Ground truth for the production FIS at its own grid, including the
+# temp_edge cell (R2-03a) - the production output sets also touch 0/100
+# (R2-03b), exercised by every parity check on this FIS.
+parity_vs_fuzzyr("builder FIS (R2-03 fixed): optimal, mixed and temp-edge cells match FuzzyR",
+                 prod_fis, prod_cells[c("optimal", "mixed", "temp_edge"), , drop = FALSE], out_disc = 101)
 
 # ---------------------------------------------------------------------------
 # Summary
