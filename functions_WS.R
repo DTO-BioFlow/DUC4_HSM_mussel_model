@@ -65,7 +65,7 @@ get_container_cpu_limit <- function() {
 # Each worker loads, aggregates and NA-converts one full-resolution month
 # (9 layers x ~27 M cells) before running the HSM, so the worker count must
 # also respect the memory the container actually has (review R1-06/R2-12) -
-# a CPU-only count (19 workers on a 20-core host) could OOM a pod whose
+# a CPU-only count (20 workers on a 20-core host) could OOM a pod whose
 # memory limit is far smaller than its CPU count suggests.
 
 # Reads one line from a cgroup/proc file as a number; NA if the file is
@@ -77,25 +77,47 @@ read_number_file <- function(path) {
   suppressWarnings(as.numeric(trimws(line)))
 }
 
+# Reads one "key value" line from a cgroup memory.stat file as a number; NA
+# if the file or key is missing/unreadable (I/O boundary).
+read_stat_key <- function(path, key) {
+  if (!file.exists(path)) return(NA_real_)
+  lines <- tryCatch(readLines(path, warn = FALSE), error = function(e) character(0))
+  hit <- grep(paste0("^", key, " "), lines, value = TRUE)
+  if (length(hit) != 1) return(NA_real_)
+  suppressWarnings(as.numeric(strsplit(trimws(hit), "\\s+")[[1]][2]))
+}
+
 # Returns the bytes still available under the container's cgroup memory
-# limit (limit - current usage), or NA if no limit is set/readable.
+# limit, or NA if no limit is set/readable. Usage counts the working set
+# only: cgroup usage (memory.current / usage_in_bytes) also includes page
+# cache, and the inactive part of it is reclaimed on demand - on EDITO the
+# ~8 GB of input downloaded just before this runs sits in exactly that cache
+# and would otherwise shrink the worker count to 1 (review R4-01). Same
+# working-set definition as kubelet and `docker stats`. If memory.stat is
+# unreadable, the raw usage is used (conservative).
 # Paths are arguments so tests can point them at fixture files.
 get_container_memory_available <- function(
     v2_max     = "/sys/fs/cgroup/memory.max",
     v2_current = "/sys/fs/cgroup/memory.current",
+    v2_stat    = "/sys/fs/cgroup/memory.stat",
     v1_limit   = "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    v1_usage   = "/sys/fs/cgroup/memory/memory.usage_in_bytes") {
+    v1_usage   = "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    v1_stat    = "/sys/fs/cgroup/memory/memory.stat") {
   # cgroup v2: memory.max is "max" when unlimited (read_number_file -> NA)
   limit <- read_number_file(v2_max)
   usage <- read_number_file(v2_current)
+  inactive_file <- read_stat_key(v2_stat, "inactive_file")
   if (is.na(limit)) {
     # cgroup v1: "unlimited" is a page-aligned INT64_MAX (~9.2e18)
     limit <- read_number_file(v1_limit)
     usage <- read_number_file(v1_usage)
+    inactive_file <- read_stat_key(v1_stat, "total_inactive_file")
     if (!is.na(limit) && limit >= 2^60) limit <- NA_real_
   }
   if (is.na(limit)) return(NA_real_)
-  max(0, limit - if (is.na(usage)) 0 else usage)
+  if (is.na(usage)) usage <- 0
+  if (!is.na(inactive_file)) usage <- max(0, usage - inactive_file)
+  max(0, limit - usage)
 }
 
 # Returns MemAvailable from /proc/meminfo in bytes, or NA if unreadable.
@@ -125,9 +147,12 @@ get_available_memory <- function(container = get_container_memory_available(),
 #   available_mem - the memory figure used, in bytes (NA if unknown)
 # An explicit override always wins (it is the user's deliberate choice), but
 # a line is printed when it exceeds the memory cap. Otherwise the count is
-# the tightest of: host cores capped by the cgroup CPU limit minus one,
+# the tightest of: host cores capped by the cgroup CPU limit,
 # floor(available memory / mem_per_worker_gb), and the number of jobs;
-# floored at 1. The detection inputs are arguments so tests can inject them.
+# floored at 1. No core is held back for the parent: during mclapply it only
+# blocks in mccollect, so cores - 1 would idle a CPU (on a 2-CPU pod it would
+# halve throughput - review R4-08); memory is capped separately.
+# The detection inputs are arguments so tests can inject them.
 resolve_worker_count <- function(override = NA_integer_,
                                  mem_per_worker_gb,
                                  n_jobs,
@@ -148,7 +173,7 @@ resolve_worker_count <- function(override = NA_integer_,
   }
 
   n_cpu <- if (!is.na(cpu_limit)) min(host_cores, cpu_limit) else host_cores
-  caps <- c(cpu = max(1L, as.integer(n_cpu) - 1L),
+  caps <- c(cpu = max(1L, as.integer(n_cpu)),
             memory = mem_cap,
             jobs = max(1L, as.integer(n_jobs)))
   caps <- caps[!is.na(caps)]
@@ -187,11 +212,107 @@ load_bpns_month <- function(folder, i) {
   return(BPNS_1)
 }
 
+# Layers expected to be the same file in every month (layer name -> file
+# number): in the BPNS input set, sedimentation (7) and substrate (8) are
+# byte-identical across all 12 months (review R2-10/R4-11), so they are
+# aggregated once instead of once per month. This is only a candidate list -
+# prepare_static_layers() verifies it against the actual files on every run.
+STATIC_BPNS_LAYERS <- c(sedrate = 7, substrate = 8)
+
+# Aggregates (10x10 mean) the STATIC_BPNS_LAYERS once, for use by every
+# month's prepare_bpns_month(). A candidate layer is only treated as static
+# if its files are byte-identical (md5) across all `months`; otherwise it is
+# logged and left to per-month processing, so a changed input set can never
+# silently get another month's data. Returns a named list of aggregated
+# RasterLayers (empty if no layer qualifies).
+prepare_static_layers <- function(folder, months) {
+  static_names <- character(0)
+  for (nm in names(STATIC_BPNS_LAYERS)) {
+    files <- file.path(folder, sprintf("BPNS_%d_%d.tif", months, STATIC_BPNS_LAYERS[[nm]]))
+    if (length(unique(tools::md5sum(files))) == 1) {
+      static_names <- c(static_names, nm)
+    } else {
+      cat(">>> Layer", nm, "differs between months - aggregated per month instead of once\n")
+    }
+  }
+  if (length(static_names) == 0) return(list())
+  # Each layer is aggregated in its own short-lived forked child, in parallel,
+  # never in the parent: aggregating in the parent left it ~3.8 GB larger
+  # (measured, F6), which every forked month worker then inherits and partly
+  # copies (R's GC touches shared pages) - that cut the worker count from 11
+  # to 8 and pushed the run to a 17.7 GB peak.
+  # todisk = TRUE forces the same processing path a full month takes: a 9- or
+  # 7-layer month never fits raster's in-memory limit (maxmemory 5e9 bytes),
+  # so aggregate() streams it through a float32 temp file, rounding each block
+  # mean to float32. A single layer *does* fit, and in memory its means stay
+  # double - substrate then differed in 7,157 cells by up to 5.8e-8, enough to
+  # move output values by ~4e-6 (measured, F6). With todisk the result is
+  # bit-identical to aggregating it inside the month's stack. readAll() brings
+  # the small aggregated layer (~272k cells) back in memory rather than as a
+  # reference to a temp file.
+  aggregate_one <- function(nm) {
+    old_todisk <- rasterOptions()$todisk
+    rasterOptions(todisk = TRUE)
+    on.exit(rasterOptions(todisk = old_todisk))
+    readAll(aggregate(load_bpns_month(folder, months[1])[[nm]], fact = 10))
+  }
+  aggr <- if (.Platform$OS.type == "windows") {
+    lapply(static_names, aggregate_one)
+  } else {
+    parallel::mclapply(static_names, aggregate_one,
+                       mc.cores = length(static_names), mc.preschedule = FALSE)
+  }
+  failures <- describe_failed_months(aggr, static_names)
+  if (length(failures) > 0) {
+    stop(sprintf("Aggregating static layer(s) failed: %s",
+                 paste(names(failures), failures, sep = ": ", collapse = "; ")))
+  }
+  names(aggr) <- static_names
+  aggr
+}
+
 # Full per-month preprocessing: load, aggregate 10x10 (mean), then replace
 # NA with the -9999 sentinel (fun9999). Runs inside each parallel worker, so
 # only one full-resolution month is in flight per worker (review R1-06).
-prepare_bpns_month <- function(folder, i) {
-  calc(stack(aggregate(load_bpns_month(folder, i), fact = 10)), fun9999)
+# `static` (from prepare_static_layers) supplies already-aggregated layers;
+# only the remaining layers are aggregated here, and the stack is reassembled
+# in the original layer order so the result is identical to aggregating all.
+prepare_bpns_month <- function(folder, i, static = list()) {
+  month_stack <- load_bpns_month(folder, i)
+  if (length(static) == 0) {
+    return(calc(stack(aggregate(month_stack, fact = 10)), fun9999))
+  }
+  layer_order <- names(month_stack)
+  dynamic <- setdiff(layer_order, names(static))
+  aggr <- as.list(aggregate(month_stack[[dynamic]], fact = 10))
+  names(aggr) <- dynamic
+  full <- stack(c(aggr, static)[layer_order])
+  names(full) <- layer_order
+  calc(full, fun9999)
+}
+
+# One line per job (month, or static layer) whose worker did not return the
+# expected RasterLayer, named by job: the worker's own error message for a
+# try-error (mclapply
+# keeps it only in attr(, "condition") and never prints it - review R4-02),
+# or what came back instead. Checks for the success shape rather than listing
+# failure shapes, so any other kind of lost/odd result is caught too.
+describe_failed_months <- function(results, months) {
+  msgs <- character(0)
+  for (k in seq_along(months)) {
+    x <- results[[k]]
+    if (inherits(x, "RasterLayer")) next
+    why <- if (inherits(x, "try-error")) {
+      cond <- attr(x, "condition")
+      if (!is.null(cond)) conditionMessage(cond) else trimws(as.character(x))
+    } else if (is.null(x)) {
+      "no result - worker was killed (e.g. out of memory)"
+    } else {
+      sprintf("unexpected result of class %s", paste(class(x), collapse = "/"))
+    }
+    msgs[as.character(months[k])] <- why
+  }
+  msgs
 }
 
 hsm_calc_year_cpp <- function(df, j, out_disc = 201) {
@@ -511,13 +632,19 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
   #######################
   # Add input variables #
   #######################
+  # Each variable's range is passed as c(min, max): FuzzyR's addvar() stores
+  # range(varBounds), so this declares exactly [min, max]. It used to be
+  # seq(min, max), which silently truncated a fractional max (seq(0, 0.5) is
+  # just 0) - and since the evaluator clamps into the declared range (R2-03),
+  # that would have forced every value of that layer to one number (review
+  # R4-04). For integer bounds both forms give the same range.
   # 1.  Temperature -------------------------------------------------------------------------------------------------------------------------
   if ("temp" %in% params){
     musselbed <- addvar(
       musselbed,
       'input', #input or output
       "temperature",
-      seq(ranges$temp[1], ranges$temp[2]),
+      c(ranges$temp[1], ranges$temp[2]),
       method = NULL,
       params = NULL,
       firing.method = "tnorm.min.max"
@@ -535,7 +662,7 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
       musselbed,
       'input', #input or output
       "salinity",
-      seq(ranges$sal[1], ranges$sal[2]),
+      c(ranges$sal[1], ranges$sal[2]),
       method = NULL,
       params = NULL,
       firing.method = "tnorm.min.max"
@@ -552,7 +679,7 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
       musselbed,
       'input', #input or output
       "Oxy",
-      seq(ranges$oxy[1], ranges$oxy[2]),
+      c(ranges$oxy[1], ranges$oxy[2]),
       method = NULL,
       params = NULL,
       firing.method = "tnorm.min.max"
@@ -569,7 +696,7 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
       musselbed,
       'input', #input or output
       "substrate",
-      seq(ranges$sub[1], ranges$sub[2]),
+      c(ranges$sub[1], ranges$sub[2]),
       method = NULL,
       params = NULL,
       firing.method = "tnorm.min.max"
@@ -586,7 +713,7 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
       musselbed,
       'input', #input or output
       "sedimentation",
-      seq(ranges$sed[1], ranges$sed[2]),
+      c(ranges$sed[1], ranges$sed[2]),
       method = NULL,
       params = NULL,
       firing.method = "tnorm.min.max"
@@ -603,7 +730,7 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
       musselbed,
       'input', #input or output
       "current speed",
-      seq(ranges$cur[1], ranges$cur[2]),
+      c(ranges$cur[1], ranges$cur[2]),
       method = NULL,
       params = NULL,
       firing.method = "tnorm.min.max"
@@ -620,7 +747,7 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
       musselbed,
       'input', #input or output
       "orbital velocity",
-      seq(ranges$orb[1], ranges$orb[2]),
+      c(ranges$orb[1], ranges$orb[2]),
       method = NULL,
       params = NULL,
       firing.method = "tnorm.min.max"
@@ -637,7 +764,7 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
       musselbed,
       'input', #input or output
       "PP",
-      seq(ranges$chl[1], ranges$chl[2]),
+      c(ranges$chl[1], ranges$chl[2]),
       method = NULL,
       params = NULL,
       firing.method = "tnorm.min.max"
@@ -655,7 +782,7 @@ build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
       musselbed,
       'input', #input or output
       "shear stress",
-      seq(ranges$shear[1], ranges$shear[2]),
+      c(ranges$shear[1], ranges$shear[2]),
       method = NULL,
       params = NULL,
       firing.method = "tnorm.min.max"

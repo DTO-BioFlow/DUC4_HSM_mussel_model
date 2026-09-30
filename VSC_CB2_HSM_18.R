@@ -59,10 +59,21 @@ load_params <- function() {
 
   # Per-parameter MF ranges: one range_<code> PARAMS key per entry in
   # p_parameters, falling back to DEFAULT_MF_RANGES (functions_WS.R) so
-  # behavior is unchanged unless explicitly overridden.
+  # behavior is unchanged unless explicitly overridden. Parsed as numbers,
+  # not integers: "0,0.5" used to become c(0,0), and since the evaluator
+  # clamps into the declared range that silently collapsed the whole layer
+  # to one value (review R4-04/R1-01). A value that isn't two finite numbers
+  # with min < max stops the run instead.
   ranges <- setNames(
     lapply(p_parameters, function(code) {
-      get_vec(paste0("range_", code), default = DEFAULT_MF_RANGES[[code]])
+      key <- paste0("range_", code)
+      v <- raw[[key]]
+      if (is.null(v) || v == "" || v == "NULL") return(DEFAULT_MF_RANGES[[code]])
+      rng <- suppressWarnings(as.numeric(trimws(strsplit(v, ",")[[1]])))
+      if (length(rng) != 2 || any(!is.finite(rng)) || rng[1] >= rng[2]) {
+        stop(sprintf("Invalid '%s' in PARAMS file: %s (must be two numbers min,max with min < max)", key, v))
+      }
+      rng
     }),
     p_parameters
   )
@@ -245,12 +256,20 @@ toc("Build fuzzy logic model", t0)
 # serially for all months before the parallel phase and dominated the
 # runtime (review R1-06: 758 of 857 s). Each worker now handles one whole
 # month, so the worker count is capped by memory as well as CPUs (R2-12).
-t0 <- tic("Preprocess + HSM per month (parallel)")
 folder <- if (grepl("[/\\]$", bpns_input_dir)) bpns_input_dir else paste0(bpns_input_dir, "/")
 
+# Layers whose file is identical in every month (sedimentation, substrate)
+# are aggregated once here instead of once per month, and shared with the
+# forked workers copy-on-write (review R4-11).
+t0 <- tic("Aggregate static layers")
+static_layers <- prepare_static_layers(folder, months_to_process)
+cat(">>> Static layers aggregated once:", if (length(static_layers)) paste(names(static_layers), collapse = ", ") else "none", "\n")
+toc("Aggregate static layers", t0)
+
+t0 <- tic("Preprocess + HSM per month (parallel)")
 process_month <- function(j) {
   cat("Processing month:", j, "\n")
-  hsm_calc_year_cpp2(prepare_bpns_month(folder, j), j, fuzzy_model_year, p$out_disc)
+  hsm_calc_year_cpp2(prepare_bpns_month(folder, j, static_layers), j, fuzzy_model_year, p$out_disc)
 }
 
 workers <- resolve_worker_count(p$n_cores, p$mem_per_worker_gb, length(months_to_process))
@@ -281,12 +300,14 @@ results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
 names(results_HSM_Cpp) <- as.character(months_to_process)
 
 # mclapply returns a try-error object per element on worker failure instead of
-# raising, so failures must be checked explicitly before writing output. A
-# worker killed by the OS (e.g. OOM) leaves NULL in its slot instead - not a
-# try-error - so that must be checked too (review R1-05).
-failed <- months_to_process[vapply(results_HSM_Cpp, function(x) inherits(x, "try-error") || is.null(x), logical(1))]
-if (length(failed) > 0) {
-  stop(sprintf("HSM calculation failed for month(s): %s", paste(failed, collapse = ", ")))
+# raising (and a worker killed by the OS, e.g. OOM, leaves NULL), so failures
+# must be checked explicitly before writing output (review R1-05). Each failed
+# month's cause is printed - mclapply never prints it itself, and the EDITO
+# container is gone afterwards (review R4-02).
+failures <- describe_failed_months(results_HSM_Cpp, months_to_process)
+if (length(failures) > 0) {
+  cat(sprintf(">>> Month %s failed: %s\n", names(failures), failures), sep = "")
+  stop(sprintf("HSM calculation failed for month(s): %s", paste(names(failures), collapse = ", ")))
 }
 toc("Preprocess + HSM per month (parallel)", t0)
 

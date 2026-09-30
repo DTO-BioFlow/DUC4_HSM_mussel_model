@@ -472,6 +472,20 @@ record("builder: rule response classes optimal/good/okay/bad = 1/162/2688/16832 
        identical(as.integer(resp), c(1L, 162L, 2688L, 16832L)) && identical(names(resp), c("1", "2", "3", "4")),
        paste(names(resp), as.integer(resp), sep = ":", collapse = " "))
 
+# Declared input ranges (review R4-04): with the defaults they must be exactly
+# DEFAULT_MF_RANGES, and a fractional override must be declared as given -
+# the builder used seq(min, max), which turned c(0, 1.5) into [0, 1] (and
+# c(0, 0.5) into [0, 0]), and the evaluator clamps into the declared range.
+declared <- lapply(prod_fis$input, function(v) as.numeric(v$range))
+record("builder: default declared ranges equal DEFAULT_MF_RANGES (R4-04)",
+       isTRUE(all.equal(declared, unname(DEFAULT_MF_RANGES[parameters]))),
+       paste(vapply(declared, paste, "", collapse = ","), collapse = " | "))
+frac_ranges <- DEFAULT_MF_RANGES; frac_ranges$cur <- c(0, 1.5)
+frac_fis <- build_fuzzy_logic_model_yearrc2(parameters, NULL, ranges = frac_ranges)
+record("builder: fractional range override declared exactly, not truncated (R4-04)",
+       identical(as.numeric(frac_fis$input[[6]]$range), c(0, 1.5)),
+       paste(frac_fis$input[[6]]$range, collapse = ","))
+
 # Cells (one column per input, in FIS order temp,sal,oxy,sub,sed,cur,orb,chl,shear):
 # all inputs at the optimal plateau/peak; a mixed cell in the ramps; a cell
 # missing one layer (-9999 = NA sentinel) -> NA because every rule constrains
