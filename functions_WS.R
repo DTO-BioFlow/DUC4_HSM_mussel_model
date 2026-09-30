@@ -2,8 +2,10 @@
 ##              Functions              ##
 #########################################
 
-# Unused/legacy helper functions have been moved to functions_WS_legacy.R
-# (not sourced by the pipeline, not uploaded to the S3 scripts/ prefix).
+# The unused/legacy helper functions that used to live in functions_WS_legacy.R
+# were deleted on 2026-09-30 (review R3-04, dev_plan.md F5): none was called by
+# the pipeline or tests. The original is in git history (last present in commit
+# df4d947); a local, git-ignored copy is functions_WS_legacy_bckp_20260924.R.
 
 # function to change NA to -9999 to work in fuzzy logic. -9999 must match
 # evalfis_cpp2()'s na_sentinel default (pkg/fuzzyfis/src/evalfis2.cpp) - that
